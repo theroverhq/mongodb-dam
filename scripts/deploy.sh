@@ -16,8 +16,15 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${MONGODB_ROOT_USERNAME:?Set MONGODB_ROOT_USERNAME}"
 : "${MONGODB_ROOT_PASSWORD:?Set MONGODB_ROOT_PASSWORD}"
 
-if [[ "$ENDPOINT" != https://* ]]; then
-  printf '%s\n' 'ENDPOINT must use HTTPS.' >&2
+demo_mode="${DEMO_MODE:-false}"
+if [[ "$demo_mode" != "true" && "$demo_mode" != "false" ]]; then
+  printf '%s\n' 'DEMO_MODE must be true or false.' >&2
+  exit 1
+fi
+if [[ "$ENDPOINT" != https://* \
+  && !( "$demo_mode" == "true" \
+    && "$ENDPOINT" == "http://mock-endpoint:8088/v1/ingest/mongodb-dam" ) ]]; then
+  printf '%s\n' 'ENDPOINT must use HTTPS. Demo mode permits only the bundled http://mock-endpoint endpoint.' >&2
   exit 1
 fi
 
@@ -28,6 +35,8 @@ release="${RELEASE:-mongodb-dam}"
 tag="${TAG:-dev}"
 observer_repository="${OBSERVER_IMAGE_REPOSITORY:-mongodb-dam-observer}"
 outpost_repository="${OUTPOST_IMAGE_REPOSITORY:-mongodb-dam-outpost}"
+demo_api_repository="${DEMO_API_IMAGE_REPOSITORY:-mongodb-dam-demo-api}"
+demo_receiver_repository="${DEMO_RECEIVER_IMAGE_REPOSITORY:-mongodb-dam-mock-endpoint}"
 mongodb_image_tag="${MONGODB_IMAGE_TAG:-}"
 secret_name="${SECRET_NAME:-mongodb-dam-secrets}"
 values_file="${VALUES_FILE:-}"
@@ -96,8 +105,21 @@ fi
 if [[ -n "$mongodb_image_tag" ]]; then
   helm_args+=(--set-string "mongodb.image.tag=$mongodb_image_tag")
 fi
+if [[ "$demo_mode" == "true" ]]; then
+  helm_args+=(
+    --set "demo.enabled=true"
+    --set-string "demo.api.image.repository=$demo_api_repository"
+    --set-string "demo.api.image.tag=$tag"
+    --set-string "demo.receiver.image.repository=$demo_receiver_repository"
+    --set-string "demo.receiver.image.tag=$tag"
+  )
+fi
 helm "${helm_args[@]}"
 
 kubectl -n "$namespace" rollout status "daemonset/${release}-observer" --timeout="${DEPLOY_TIMEOUT:-10m}"
 kubectl -n "$namespace" rollout status "deployment/${release}-outpost" --timeout="${DEPLOY_TIMEOUT:-10m}"
 kubectl -n "$namespace" rollout status "statefulset/${release}-mongodb" --timeout="${DEPLOY_TIMEOUT:-10m}"
+if [[ "$demo_mode" == "true" ]]; then
+  kubectl -n "$namespace" rollout status "deployment/${release}-demo-api" --timeout="${DEPLOY_TIMEOUT:-10m}"
+  kubectl -n "$namespace" rollout status "deployment/${release}-demo-receiver" --timeout="${DEPLOY_TIMEOUT:-10m}"
+fi

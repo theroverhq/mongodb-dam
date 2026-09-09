@@ -1,0 +1,181 @@
+{{- if .Values.demo.enabled }}
+{{- if not .Values.mongodb.enabled }}
+{{- fail "demo.enabled requires mongodb.enabled" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-demo-api
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: demo-api
+  template:
+    metadata:
+      labels:
+        {{- include "mongodb-dam.labels" . | nindent 8 }}
+        app.kubernetes.io/component: demo-api
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: demo-api
+          image: "{{ .Values.demo.api.image.repository }}:{{ .Values.demo.api.image.tag }}"
+          imagePullPolicy: {{ .Values.demo.api.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: MONGODB_HOST
+              value: {{ printf "%s-mongodb" (include "mongodb-dam.fullname" .) | quote }}
+            - name: MONGODB_PORT
+              value: {{ int64 .Values.mongodb.service.port | quote }}
+            - name: MONGODB_DATABASE
+              value: {{ .Values.demo.database | quote }}
+            - name: MONGODB_AUTH_SOURCE
+              value: admin
+            - name: MONGODB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-dam.secretName" . }}
+                  key: mongodb-root-username
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-dam.secretName" . }}
+                  key: mongodb-root-password
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.demo.api.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-demo-api
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo-api
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: demo-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-demo-receiver
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo-receiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: demo-receiver
+  template:
+    metadata:
+      labels:
+        {{- include "mongodb-dam.labels" . | nindent 8 }}
+        app.kubernetes.io/component: demo-receiver
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: demo-receiver
+          image: "{{ .Values.demo.receiver.image.repository }}:{{ .Values.demo.receiver.image.tag }}"
+          imagePullPolicy: {{ .Values.demo.receiver.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: MOCK_ENDPOINT_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-dam.secretName" . }}
+                  key: bearer-token
+            - name: MOCK_ENDPOINT_MAX_BATCHES
+              value: {{ int64 .Values.demo.receiver.maxRetainedBatches | quote }}
+          ports:
+            - name: http
+              containerPort: 8088
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.demo.receiver.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # Outpost permits cleartext HTTP only for this exact bundled mock hostname.
+  name: mock-endpoint
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo-receiver
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: demo-receiver
+  ports:
+    - name: http
+      port: 8088
+      targetPort: http
+{{- end }}

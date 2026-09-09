@@ -1,0 +1,17 @@
+# Disposable DAM presentation mode. Never use this receiver as a real regional endpoint.
+destination:
+  endpoint: http://mock-endpoint:8088/v1/ingest/mongodb-dam
+
+mongodb:
+  persistence:
+    enabled: false
+
+observer:
+  cpuProfileHz: 0
+
+outpost:
+  persistence:
+    enabled: false
+
+demo:
+  enabled: true

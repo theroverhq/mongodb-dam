@@ -26,4 +26,4 @@ mongodb_password="$(openssl rand -base64 32 | tr -d '\n')"
 
 chmod 600 "$output"
 printf 'Wrote local secret environment file (mode 0600): %s\n' "$output"
-printf '%s\n' 'The generated BEARER_TOKEN must also be provisioned at the regional endpoint.'
+printf '%s\n' 'For a regional deployment, provision the generated BEARER_TOKEN at the configured endpoint. Demo mode configures its bundled receiver automatically.'

@@ -58,7 +58,7 @@ PUSH_IMAGES=true \
 ```
 
 Authenticate Docker to the registry first. For a local cluster, omit `REGISTRY` and `PUSH_IMAGES`, then load the resulting images using the mechanism provided by kind, minikube, or your local runtime.
-Set `BUILD_MOCK=true` only when you also want the disposable endpoint test image; it is not built or pushed for a normal customer deployment.
+Set `BUILD_MOCK=true` only when you want the disposable endpoint test image. Set `BUILD_DEMO=true` to build both that receiver and the demo REST API; neither is built or pushed for a normal deployment.
 
 Run the full Rust/eBPF build-time suite and the disposable Outpost contract test locally with:
 
@@ -68,6 +68,12 @@ make test-http-push
 ```
 
 On a Linux Docker host that permits privileged containers, run the live probe-to-MongoDB test with `make test-ebpf`. Override `MONGODB_TEST_IMAGE` when the host kernel is incompatible with the chart's pinned MongoDB 8 image.
+
+## Run the presentation demo
+
+The opt-in demo mode adds a constrained REST application and an in-memory receiver so a presenter can seed dummy commerce data, call `find`/`insert`/`update`/`aggregate`/`delete` operations over HTTP from a client machine, and immediately display the metadata that Observer captured and Outpost delivered.
+
+Build it with `BUILD_DEMO=true`, deploy with `DEMO_MODE=true` and `deploy/examples/demo-values.yaml`, then run `scripts/run-demo.sh`. The exact setup and individual curl commands are in the [three-step demo walkthrough](docs/DEMO.md). MongoDB Community itself does not expose a general-purpose REST query API; the bundled demo API provides that application layer.
 
 ## Deploy to the other cloud account
 
@@ -113,6 +119,7 @@ Set `ENDPOINT_CA_FILE=/path/to/ca.pem` when the endpoint uses a private CA. Secr
 - `crates/mongo-protocol/`: safe MongoDB wire/BSON metadata decoder.
 - `crates/schema/`: the only serializable data model allowed out of the customer node.
 - `crates/mock-endpoint/`: local stand-in for the configured regional endpoint.
+- `demo/api/`: disposable HTTP application that creates visible MongoDB activity.
 - `deploy/helm/mongodb-dam/`: single Helm chart for the customer cluster.
 - `scripts/`: local build, preflight, deployment, and smoke-test entry points.
 
@@ -125,3 +132,70 @@ TLS visibility depends on compatible, visible `SSL_*` symbols. Observer checks m
 The profiler emits raw instruction addresses for later symbolization; regional flamegraph aggregation and symbol management belong in the next product phase. The stated overhead must be benchmarked against the customer's kernel, traffic, and profiling settings—it is not safe to promise a universal percentage.
 
 See [known gaps](docs/KNOWN_GAPS.md) and [operations](docs/OPERATIONS.md) before production use.
+
+## Exact three-step DAM demo
+
+The three-step DAM demo is implemented. It uses a small REST service backed by the official [PyMongo driver](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/), plus an in-memory receiver for viewing Outpost deliveries.
+
+I did not deploy it because the active kubecontext is still `rover-dev-auto`, not your separate customer/demo account. Full build and deployment commands are in [DEMO.md](docs/DEMO.md#deploy-demo-mode).
+
+After deploying in demo mode:
+
+### 1. Seed MongoDB
+
+Keep this running:
+
+```bash
+kubectl -n mongodb-dam port-forward service/mongodb-dam-demo-api 8080:8080
+```
+
+In another terminal:
+
+```bash
+curl --fail --silent --request POST \
+  http://127.0.0.1:8080/demo/seed | jq .
+```
+
+This creates five dummy customers and eight orders in `dam_demo`.
+
+### 2. Execute queries from the client machine
+
+Run all five recognizable MongoDB operations:
+
+```bash
+curl --fail --silent --request POST \
+  http://127.0.0.1:8080/demo/workload | jq .
+```
+
+This performs:
+
+```text
+find → insert → update → aggregate → delete
+```
+
+Individual HTTP examples are in [the walkthrough](docs/DEMO.md#2-execute-queries-over-http-from-the-client-machine).
+
+### 3. See captured DAM activity
+
+Observer performs the capture; Outpost validates, enriches, and delivers it.
+
+The easiest option runs the entire presentation and prints sanitized events plus Observer/Outpost counters:
+
+```bash
+export EXPECTED_KUBE_CONTEXT=<customer-demo-context>
+# BEARER_TOKEN should already be loaded from secrets.local.env
+
+./scripts/run-demo.sh
+```
+
+The output table includes:
+
+```text
+OBSERVED_AT  COMMAND  DATABASE  COLLECTION  DURATION_US  SUCCEEDED  SOURCE  POD
+```
+
+It should show `find`, `insert`, `update`, `aggregate`, and `delete`, without query filters, emails, order IDs, amounts, or document bodies.
+
+The implementation is in [run-demo.sh](scripts/run-demo.sh), and the demo Kubernetes components are in [demo.yaml](deploy/helm/mongodb-dam/templates/demo.yaml).
+
+Validation passed: 25 Rust tests, strict Clippy, Helm lint/render, demo API integration, Bearer-protected receiver readback, and Outpost delivery/quarantine tests.

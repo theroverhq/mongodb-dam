@@ -100,6 +100,37 @@ outpost:
   tolerations: []
   affinity: {}
 
+# Disposable presentation components. Enable only with deploy/examples/demo-values.yaml.
+# The REST API generates MongoDB traffic; the receiver retains recent Outpost batches in memory.
+demo:
+  enabled: false
+  database: dam_demo
+  api:
+    image:
+      repository: mongodb-dam-demo-api
+      tag: dev
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+  receiver:
+    image:
+      repository: mongodb-dam-mock-endpoint
+      tag: dev
+      pullPolicy: IfNotPresent
+    maxRetainedBatches: 250
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+
 networkPolicy:
   enabled: false
 

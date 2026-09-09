@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -9,8 +9,13 @@ use axum::{
 };
 use clap::Parser;
 use dam_schema::DamBatch;
-use serde::Serialize;
-use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashSet, VecDeque},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::{fs, net::TcpListener, sync::Mutex};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -36,12 +41,16 @@ struct Cli {
     token: String,
     #[arg(long, env = "MOCK_ENDPOINT_OUTPUT_DIR")]
     output_dir: Option<PathBuf>,
+    #[arg(long, env = "MOCK_ENDPOINT_MAX_BATCHES", default_value_t = 250)]
+    max_batches: usize,
 }
 
 #[derive(Clone)]
 struct AppState {
     token: Arc<String>,
     seen: Arc<Mutex<HashSet<String>>>,
+    batches: Arc<Mutex<VecDeque<DamBatch>>>,
+    max_batches: usize,
     output_dir: Option<PathBuf>,
 }
 
@@ -57,6 +66,18 @@ struct Health {
     service: &'static str,
     status: &'static str,
     received_batches: usize,
+    retained_batches: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct BatchList {
+    count: usize,
+    batches: Vec<DamBatch>,
 }
 
 #[tokio::main]
@@ -68,16 +89,20 @@ async fn main() -> Result<()> {
         .json()
         .init();
     let cli = Cli::parse();
+    anyhow::ensure!(cli.max_batches > 0, "max_batches must be positive");
     if let Some(directory) = &cli.output_dir {
         fs::create_dir_all(directory).await?;
     }
     let state = AppState {
         token: Arc::new(cli.token),
         seen: Arc::new(Mutex::new(HashSet::new())),
+        batches: Arc::new(Mutex::new(VecDeque::new())),
+        max_batches: cli.max_batches,
         output_dir: cli.output_dir,
     };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/batches", get(list_batches))
         .route("/v1/ingest/mongodb-dam", post(ingest))
         .with_state(state);
     let listener = TcpListener::bind(cli.listen_addr)
@@ -89,11 +114,38 @@ async fn main() -> Result<()> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
+    let received_batches = state.seen.lock().await.len();
+    let retained_batches = state.batches.lock().await.len();
     Json(Health {
         service: "mock-endpoint",
         status: "ok",
-        received_batches: state.seen.lock().await.len(),
+        received_batches,
+        retained_batches,
     })
+}
+
+async fn list_batches(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !authorized(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    }
+    let limit = query.limit.unwrap_or(50).clamp(1, state.max_batches);
+    let batches = state
+        .batches
+        .lock()
+        .await
+        .iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    Json(BatchList {
+        count: batches.len(),
+        batches,
+    })
+    .into_response()
 }
 
 async fn ingest(
@@ -101,11 +153,7 @@ async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let token = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    let expected = format!("Bearer {}", state.token);
-    if token != Some(expected.as_str()) {
+    if !authorized(&headers, &state.token) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
     let Some(idempotency_key) = headers
@@ -138,16 +186,32 @@ async fn ingest(
         if let Err(error) =
             fs::write(directory.join(format!("{idempotency_key}.json")), &body).await
         {
+            state.seen.lock().await.remove(&idempotency_key);
             return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     }
+    let ingest_batch_id = batch.batch_id.clone();
+    let mut batches = state.batches.lock().await;
+    batches.push_front(batch);
+    while batches.len() > state.max_batches {
+        batches.pop_back();
+    }
+    drop(batches);
     (
         StatusCode::ACCEPTED,
         Json(Receipt {
             status: "accepted",
             receipt_id: format!("mock-{idempotency_key}"),
-            ingest_batch_id: batch.batch_id,
+            ingest_batch_id,
         }),
     )
         .into_response()
+}
+
+fn authorized(headers: &HeaderMap, token: &str) -> bool {
+    let provided = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    let expected = format!("Bearer {token}");
+    provided == Some(expected.as_str())
 }

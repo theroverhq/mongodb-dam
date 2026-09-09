@@ -1,4 +1,7 @@
 .git
 target
 deploy/examples/*.local.yaml
+deploy/examples/*.local.env
+__pycache__
+*.pyc
 *.log

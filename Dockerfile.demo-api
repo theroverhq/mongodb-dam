@@ -1,0 +1,12 @@
+FROM python:3.13-slim-bookworm
+
+WORKDIR /app
+COPY demo/api/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir --requirement requirements.txt \
+    && groupadd --system --gid 65532 mongodb-dam \
+    && useradd --system --uid 65532 --gid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin mongodb-dam
+
+COPY demo/api/server.py ./server.py
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["python", "/app/server.py"]

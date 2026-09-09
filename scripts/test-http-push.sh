@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command_name in docker curl grep; do
+for command_name in docker curl grep jq; do
   command -v "$command_name" >/dev/null || {
     printf 'Missing required command: %s\n' "$command_name" >&2
     exit 1
@@ -31,6 +31,7 @@ docker run --detach --rm \
   --name "$mock" \
   --network "$network" \
   --network-alias mock-endpoint \
+  --publish 127.0.0.1::8088 \
   -e MOCK_ENDPOINT_BEARER_TOKEN=integration-bearer-token \
   mongodb-dam-mock-endpoint:dev >/dev/null
 
@@ -54,6 +55,8 @@ docker run --detach --rm \
 
 mapped="$(docker port "$outpost" 8090/tcp)"
 port="${mapped##*:}"
+mock_mapped="$(docker port "$mock" 8088/tcp)"
+mock_port="${mock_mapped##*:}"
 for _ in $(seq 1 50); do
   if curl --fail --silent "http://127.0.0.1:$port/ready" >/dev/null 2>&1; then
     break
@@ -79,6 +82,15 @@ for _ in $(seq 1 50); do
 done
 if [[ "${delivered:-false}" != true ]]; then
   printf '%s\n' 'Timed out waiting for Outpost delivery.' >&2
+  exit 1
+fi
+received="$(curl --fail --silent \
+  --header 'authorization: Bearer integration-bearer-token' \
+  "http://127.0.0.1:$mock_port/v1/batches?limit=10")"
+jq -e '.count == 1 and .batches[0].batch_id == "integration-batch-0001"' \
+  <<<"$received" >/dev/null
+if curl --fail --silent "http://127.0.0.1:$mock_port/v1/batches" >/dev/null 2>&1; then
+  printf '%s\n' 'Mock endpoint exposed batches without bearer authentication.' >&2
   exit 1
 fi
 
