@@ -1,0 +1,36 @@
+[package]
+name = "observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+dam-schema = { path = "../schema" }
+dam-spool = { path = "../spool" }
+hex.workspace = true
+libbpf-rs.workspace = true
+libbpf-sys.workspace = true
+libc.workspace = true
+mongo-protocol = { path = "../mongo-protocol" }
+prometheus.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+libbpf-cargo = "0.25"
+libbpf-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

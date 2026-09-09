@@ -1,0 +1,31 @@
+assignment:
+  customerId: customer-acme
+  tenantId: tenant-acme
+  sourceId: mongodb-prod-ap-south-1
+  regionalCellId: cell-ap-south-1
+  clusterName: acme-production-eks
+
+images:
+  observer:
+    repository: 111122223333.dkr.ecr.ap-south-1.amazonaws.com/mongodb-dam-observer
+    tag: v0.1.0
+    pullPolicy: IfNotPresent
+  outpost:
+    repository: 111122223333.dkr.ecr.ap-south-1.amazonaws.com/mongodb-dam-outpost
+    tag: v0.1.0
+    pullPolicy: IfNotPresent
+
+collect:
+  url: https://collect.cell-ap-south-1.example.com/v1/ingest/mongodb-dam
+  # For a private CA, create the named Secret in the customer cluster.
+  caSecretName: ""
+
+mongodb:
+  persistence:
+    size: 100Gi
+    storageClass: gp3
+
+outpost:
+  persistence:
+    size: 20Gi
+    storageClass: gp3

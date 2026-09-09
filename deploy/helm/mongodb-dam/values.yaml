@@ -1,0 +1,109 @@
+nameOverride: ""
+fullnameOverride: ""
+
+assignment:
+  customerId: "customer-id"
+  tenantId: "tenant-id"
+  sourceId: "mongodb-source-id"
+  regionalCellId: "regional-cell-id"
+  clusterName: "customer-cluster"
+
+secrets:
+  # The default expects this Secret to be provisioned before Helm runs.
+  existingSecret: mongodb-dam-secrets
+  create: false
+  observerInternalToken: ""
+  collectToken: ""
+  principalHashSalt: ""
+  mongodbRootUsername: ""
+  mongodbRootPassword: ""
+
+images:
+  observer:
+    repository: mongodb-dam-observer
+    tag: dev
+    pullPolicy: IfNotPresent
+  outpost:
+    repository: mongodb-dam-outpost
+    tag: dev
+    pullPolicy: IfNotPresent
+
+collect:
+  # Replace this with the HTTPS HTTP-push endpoint in the regional cell.
+  url: https://collect.invalid/v1/ingest/mongodb-dam
+  tokenHeader: x-rover-collect-token
+  idempotencyHeader: idempotency-key
+  caSecretName: ""
+  caSecretKey: collect-ca.pem
+
+mongodb:
+  enabled: true
+  image:
+    repository: mongo
+    # MongoDB 8 refuses to start on Linux kernels 6.19 through 7.0.13.
+    # scripts/preflight.sh rejects those nodes for an 8.x tag.
+    tag: 8.0.29-noble
+    pullPolicy: IfNotPresent
+  service:
+    port: 27017
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+observer:
+  cpuProfileHz: 49
+  tlsUprobes: auto
+  lockProfiling: true
+  maxMessageBytes: 50331648
+  batchMaxEvents: 200
+  batchFlushMilliseconds: 1000
+  spoolMaxBytes: 268435456
+  spoolHostPath: /var/lib/mongodb-dam/observer
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - operator: Exists
+  priorityClassName: ""
+
+outpost:
+  replicas: 1
+  spoolMaxBytes: 1073741824
+  maxRequestBytes: 5242880
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+networkPolicy:
+  enabled: false
+
+serviceMonitor:
+  enabled: false
+  interval: 30s

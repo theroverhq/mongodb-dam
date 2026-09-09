@@ -1,0 +1,17 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-namespace-ingress
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: {}
+{{- end }}

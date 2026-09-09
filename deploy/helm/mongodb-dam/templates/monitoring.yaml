@@ -1,0 +1,39 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-outpost
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: outpost
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: outpost
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  endpoints:
+    - port: http
+      interval: {{ .Values.serviceMonitor.interval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-observer
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: observer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: observer
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

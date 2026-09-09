@@ -1,0 +1,13 @@
+MongoDB DAM has been rendered for customer {{ .Values.assignment.customerId }} and regional cell {{ .Values.assignment.regionalCellId }}.
+
+MongoDB endpoint inside the cluster:
+  {{ include "mongodb-dam.fullname" . }}-mongodb.{{ .Release.Namespace }}.svc:{{ .Values.mongodb.service.port }}
+
+Verify the rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status daemonset/{{ include "mongodb-dam.fullname" . }}-observer
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "mongodb-dam.fullname" . }}-outpost
+  kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "mongodb-dam.fullname" . }}-mongodb
+
+Observer needs privileged pods, host PID access, BTF, and tracefs on every selected Linux node.
+Outpost sends metadata batches only to:
+  {{ .Values.collect.url }}

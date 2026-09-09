@@ -1,0 +1,178 @@
+{{- if ne (int .Values.outpost.replicas) 1 }}
+{{- fail "outpost.replicas must be 1 because the durable file spool is single-writer" }}
+{{- end }}
+{{- if .Values.outpost.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-outpost
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: outpost
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.outpost.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.outpost.persistence.size }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-outpost
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: outpost
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: outpost
+  template:
+    metadata:
+      labels:
+        {{- include "mongodb-dam.labels" . | nindent 8 }}
+        app.kubernetes.io/component: outpost
+    spec:
+      serviceAccountName: {{ include "mongodb-dam.fullname" . }}-outpost
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: outpost
+          image: "{{ .Values.images.outpost.repository }}:{{ .Values.images.outpost.tag }}"
+          imagePullPolicy: {{ .Values.images.outpost.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: DAM_CUSTOMER_ID
+              value: {{ required "assignment.customerId is required" .Values.assignment.customerId | quote }}
+            - name: DAM_TENANT_ID
+              value: {{ required "assignment.tenantId is required" .Values.assignment.tenantId | quote }}
+            - name: DAM_SOURCE_ID
+              value: {{ required "assignment.sourceId is required" .Values.assignment.sourceId | quote }}
+            - name: DAM_REGIONAL_CELL_ID
+              value: {{ required "assignment.regionalCellId is required" .Values.assignment.regionalCellId | quote }}
+            - name: DAM_CLUSTER_NAME
+              value: {{ required "assignment.clusterName is required" .Values.assignment.clusterName | quote }}
+            - name: OUTPOST_INTERNAL_TOKEN_FILE
+              value: /var/run/mongodb-dam/secrets/observer-internal-token
+            - name: OUTPOST_COLLECT_URL
+              value: {{ required "collect.url is required" .Values.collect.url | quote }}
+            - name: OUTPOST_COLLECT_TOKEN_FILE
+              value: /var/run/mongodb-dam/secrets/collect-token
+            - name: OUTPOST_COLLECT_TOKEN_HEADER
+              value: {{ .Values.collect.tokenHeader | quote }}
+            - name: OUTPOST_IDEMPOTENCY_HEADER
+              value: {{ .Values.collect.idempotencyHeader | quote }}
+            - name: OUTPOST_SPOOL_MAX_BYTES
+              value: {{ .Values.outpost.spoolMaxBytes | quote }}
+            - name: OUTPOST_MAX_REQUEST_BYTES
+              value: {{ .Values.outpost.maxRequestBytes | quote }}
+            - name: KUBERNETES_SERVICE_HOST
+              value: kubernetes.default.svc
+            - name: KUBERNETES_SERVICE_PORT_HTTPS
+              value: "443"
+            {{- if .Values.collect.caSecretName }}
+            - name: OUTPOST_COLLECT_CA_FILE
+              value: /var/run/mongodb-dam/collect-ca/{{ .Values.collect.caSecretKey }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.outpost.resources | nindent 12 }}
+          volumeMounts:
+            - name: spool
+              mountPath: /var/lib/mongodb-dam/outpost
+            - name: secrets
+              mountPath: /var/run/mongodb-dam/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.collect.caSecretName }}
+            - name: collect-ca
+              mountPath: /var/run/mongodb-dam/collect-ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: spool
+          {{- if .Values.outpost.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "mongodb-dam.fullname" . }}-outpost
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: secrets
+          secret:
+            secretName: {{ include "mongodb-dam.secretName" . }}
+            items:
+              - key: observer-internal-token
+                path: observer-internal-token
+              - key: collect-token
+                path: collect-token
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.collect.caSecretName }}
+        - name: collect-ca
+          secret:
+            secretName: {{ .Values.collect.caSecretName }}
+            items:
+              - key: {{ .Values.collect.caSecretKey }}
+                path: {{ .Values.collect.caSecretKey }}
+        {{- end }}
+      {{- with .Values.outpost.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.outpost.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.outpost.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-outpost
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: outpost
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: outpost
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http

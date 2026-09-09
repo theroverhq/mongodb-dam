@@ -1,0 +1,10 @@
+/target/
+/.env
+/deploy/helm/mongodb-dam/charts/
+**/*.local.yaml
+**/*.local.env
+*.pem
+*.key
+*.crt
+*.log
+.DS_Store

@@ -1,0 +1,26 @@
+FROM rust:1.88-bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY bpf ./bpf
+RUN --mount=type=cache,id=mongodb-dam-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=mongodb-dam-outpost-target,target=/src/target \
+    cargo build --locked --release --bin outpost --bin mock-collect \
+    && cp /src/target/release/outpost /outpost \
+    && cp /src/target/release/mock-collect /mock-collect
+
+FROM debian:bookworm-slim AS outpost
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 65532 --home /nonexistent --shell /usr/sbin/nologin mongodb-dam
+COPY --from=builder /outpost /usr/local/bin/mongodb-dam-outpost
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/mongodb-dam-outpost"]
+
+FROM debian:bookworm-slim AS mock-collect
+RUN useradd --system --uid 65532 --home /nonexistent --shell /usr/sbin/nologin mongodb-dam
+COPY --from=builder /mock-collect /usr/local/bin/mock-collect
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/mock-collect"]

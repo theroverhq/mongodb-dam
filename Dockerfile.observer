@@ -1,0 +1,28 @@
+FROM rust:1.88-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang libelf-dev make pkg-config zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add rustfmt
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY bpf ./bpf
+RUN --mount=type=cache,id=mongodb-dam-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=mongodb-dam-observer-target,target=/src/target \
+    cargo build --locked --release --bin observer \
+    && cp /src/target/release/observer /observer
+
+FROM builder AS test
+RUN --mount=type=cache,id=mongodb-dam-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=mongodb-dam-observer-test-target,target=/src/target \
+    cargo test --workspace --locked
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libelf1 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /observer /usr/local/bin/mongodb-dam-observer
+USER 0:0
+ENTRYPOINT ["/usr/local/bin/mongodb-dam-observer"]

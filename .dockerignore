@@ -1,0 +1,4 @@
+.git
+target
+deploy/examples/*.local.yaml
+*.log

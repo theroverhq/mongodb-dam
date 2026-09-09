@@ -1,0 +1,117 @@
+{{- if .Values.mongodb.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-mongodb
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongodb
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: mongodb
+  ports:
+    - name: mongodb
+      port: {{ .Values.mongodb.service.port }}
+      targetPort: mongodb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mongodb-dam.fullname" . }}-mongodb
+  labels:
+    {{- include "mongodb-dam.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mongodb
+spec:
+  serviceName: {{ include "mongodb-dam.fullname" . }}-mongodb
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "mongodb-dam.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: mongodb
+  template:
+    metadata:
+      labels:
+        {{- include "mongodb-dam.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mongodb
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mongodb
+          image: "{{ .Values.mongodb.image.repository }}:{{ .Values.mongodb.image.tag }}"
+          imagePullPolicy: {{ .Values.mongodb.image.pullPolicy }}
+          args:
+            - mongod
+            - --bind_ip_all
+            - --port
+            - {{ .Values.mongodb.service.port | quote }}
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-dam.secretName" . }}
+                  key: mongodb-root-username
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mongodb-dam.secretName" . }}
+                  key: mongodb-root-password
+          ports:
+            - name: mongodb
+              containerPort: {{ .Values.mongodb.service.port }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: mongodb
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: mongodb
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.mongodb.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+      {{- if not .Values.mongodb.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+      {{- with .Values.mongodb.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mongodb.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mongodb.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.mongodb.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "mongodb-dam.labels" . | nindent 10 }}
+          app.kubernetes.io/component: mongodb
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.mongodb.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.mongodb.persistence.size }}
+  {{- end }}
+{{- end }}
