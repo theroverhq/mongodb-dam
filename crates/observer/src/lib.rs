@@ -1,9 +1,10 @@
 use dam_schema::{
     CaptureConfidence, CaptureMetadata, CaptureSource, ConnectionMetadata, DamEvent, DnsActivity,
     EventPayload, HostIo, KubernetesMetadata, MongodbActivity, MongodbAuth, MongodbConnection,
-    NetworkEndpoint, ProcessLifecycle, ProcessMetadata, ProfileSample, EVENT_SCHEMA_VERSION,
+    NetworkEndpoint, ProcessLifecycle, ProcessMetadata, ProfileSample, SecurityFinding,
+    EVENT_SCHEMA_VERSION,
 };
-use mongo_protocol::{DecodedMessage, DecoderConfig, MongoCommand, StreamDecoder};
+use mongo_protocol::{DecodedMessage, DecoderConfig, DeleteScope, MongoCommand, StreamDecoder};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -111,6 +112,7 @@ pub struct ProcessorConfig {
     pub max_message_bytes: usize,
     pub cpu_profile_hz: u32,
     pub principal_hash_salt: Option<String>,
+    pub bulk_delete_threshold: u64,
 }
 
 #[derive(Clone)]
@@ -125,7 +127,9 @@ struct EventSeed {
 #[derive(Clone)]
 struct PendingRequest {
     command: MongoCommand,
-    principal_hash: Option<String>,
+    target_principal_hash: Option<String>,
+    actor_principal_hash: Option<String>,
+    connection_state_key: (u32, u64),
     request_id: i32,
     request_bytes: u32,
     compressed: bool,
@@ -144,6 +148,8 @@ struct PendingDnsQuery {
 struct ConnectionState {
     tcp_srtt_us: Option<u32>,
     retransmits: u32,
+    authenticated_principal_hash: Option<String>,
+    pending_auth_principal_hash: Option<String>,
 }
 
 struct EndpointCacheEntry {
@@ -303,11 +309,22 @@ impl EventProcessor {
             };
             // Do not retain a clear authentication principal while waiting for
             // the matching response. Hash it at the first userspace boundary.
-            let principal_hash =
+            let target_principal_hash =
                 take_hashed_principal(&mut command, self.config.principal_hash_salt.as_deref());
+            let actor_principal_hash = {
+                let state = self.connections.entry(connection_key).or_default();
+                if command_carries_authentication(&command) {
+                    if let Some(principal) = target_principal_hash.as_ref() {
+                        state.pending_auth_principal_hash = Some(principal.clone());
+                    }
+                }
+                state.authenticated_principal_hash.clone()
+            };
             let request = PendingRequest {
                 command,
-                principal_hash,
+                target_principal_hash,
+                actor_principal_hash,
+                connection_state_key: connection_key,
                 request_id: message.request_id,
                 request_bytes: message.wire_bytes,
                 compressed: message.compressed,
@@ -352,24 +369,59 @@ impl EventProcessor {
         response_id: Option<i32>,
         response_bytes: Option<u32>,
     ) -> Vec<DamEvent> {
-        let (duration_us, succeeded, error_code, error_name) = match response {
-            Some((message, duration)) => (
-                Some(duration),
-                message.status.as_ref().and_then(|status| status.ok),
-                message.status.as_ref().and_then(|status| status.code),
-                message
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.code_name.clone()),
-            ),
-            None => (None, None, None, None),
+        let (duration_us, succeeded, error_code, error_name, affected_documents, auth_done) =
+            match response {
+                Some((message, duration)) => (
+                    Some(duration),
+                    message.status.as_ref().and_then(|status| status.ok),
+                    message.status.as_ref().and_then(|status| status.code),
+                    message
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.code_name.clone()),
+                    message
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.affected_count),
+                    message.status.as_ref().and_then(|status| status.auth_done),
+                ),
+                None => (None, None, None, None, None, None),
+            };
+
+        let session_auth_principal = if command_carries_authentication(&request.command) {
+            let state = self
+                .connections
+                .entry(request.connection_state_key)
+                .or_default();
+            let principal = request
+                .target_principal_hash
+                .clone()
+                .or_else(|| state.pending_auth_principal_hash.clone());
+            if succeeded == Some(false) {
+                state.pending_auth_principal_hash = None;
+            } else if succeeded == Some(true)
+                && authentication_exchange_completed(&request.command, auth_done)
+            {
+                state.authenticated_principal_hash = principal.clone();
+                state.pending_auth_principal_hash = None;
+            }
+            principal
+        } else {
+            None
         };
+
+        let delete_scope = request.command.delete_scope.map(delete_scope_name);
         let mut result = vec![self.event_from_seed(
             request.seed.clone(),
             EventPayload::MongodbActivity(MongodbActivity {
                 command: request.command.name.clone(),
                 database: request.command.database.clone(),
                 collection: request.command.collection.clone(),
+                principal: request.actor_principal_hash.clone(),
+                principal_hashed: request.actor_principal_hash.is_some(),
+                delete_scope: delete_scope.map(str::to_string),
+                delete_statements: request.command.delete_statements,
+                affected_documents,
                 request_id: request.request_id,
                 response_id,
                 request_bytes: request.request_bytes,
@@ -384,7 +436,34 @@ impl EventProcessor {
             }),
         )];
 
-        if is_auth_command(&request.command.name) {
+        if succeeded == Some(true)
+            && affected_documents.is_some_and(|count| count >= self.config.bulk_delete_threshold)
+            && matches!(
+                request.command.delete_scope,
+                Some(DeleteScope::Multi | DeleteScope::Mixed)
+            )
+        {
+            result.push(self.event_from_seed(
+                request.seed.clone(),
+                EventPayload::SecurityFinding(SecurityFinding {
+                    rule_id: "mongodb.bulk_delete".into(),
+                    severity: "critical".into(),
+                    title: "Bulk MongoDB delete completed".into(),
+                    action: "flagged; containment required".into(),
+                    principal: request.actor_principal_hash.clone(),
+                    principal_hashed: request.actor_principal_hash.is_some(),
+                    command: request.command.name.clone(),
+                    database: request.command.database.clone(),
+                    collection: request.command.collection.clone(),
+                    delete_scope: delete_scope.map(str::to_string),
+                    affected_documents,
+                    threshold_documents: self.config.bulk_delete_threshold,
+                    connection_id: request.connection.connection_id.clone(),
+                }),
+            ));
+        }
+
+        if is_auth_command(&request.command.name) || request.command.speculative_auth {
             let default_mechanism = if is_user_management_command(&request.command.name) {
                 "user_management"
             } else {
@@ -397,8 +476,13 @@ impl EventProcessor {
                         mechanism: request
                             .command
                             .auth_mechanism
+                            .clone()
                             .unwrap_or_else(|| default_mechanism.into()),
-                        principal: request.principal_hash,
+                        principal: if command_carries_authentication(&request.command) {
+                            session_auth_principal
+                        } else {
+                            request.target_principal_hash
+                        },
                         principal_hashed: true,
                         succeeded,
                         connection_id: request.connection.connection_id,
@@ -833,10 +917,37 @@ fn capture_source(source: u8) -> CaptureSource {
 }
 
 fn is_auth_command(command: &str) -> bool {
+    is_session_auth_command(command) || is_user_management_command(command)
+}
+
+fn is_session_auth_command(command: &str) -> bool {
     matches!(
         command.to_ascii_lowercase().as_str(),
         "saslstart" | "saslcontinue" | "authenticate" | "getnonce"
-    ) || is_user_management_command(command)
+    )
+}
+
+fn command_carries_authentication(command: &MongoCommand) -> bool {
+    command.speculative_auth || is_session_auth_command(&command.name)
+}
+
+fn authentication_exchange_completed(command: &MongoCommand, auth_done: Option<bool>) -> bool {
+    if command.speculative_auth {
+        return auth_done == Some(true);
+    }
+    match command.name.to_ascii_lowercase().as_str() {
+        "saslstart" | "saslcontinue" => auth_done == Some(true),
+        "authenticate" => true,
+        _ => false,
+    }
+}
+
+fn delete_scope_name(scope: DeleteScope) -> &'static str {
+    match scope {
+        DeleteScope::Single => "single",
+        DeleteScope::Multi => "multi",
+        DeleteScope::Mixed => "mixed",
+    }
 }
 
 fn is_user_management_command(command: &str) -> bool {
@@ -1013,6 +1124,86 @@ fn parse_endpoint(value: &str, ipv6: bool) -> Option<NetworkEndpoint> {
 mod tests {
     use super::*;
 
+    fn test_processor() -> EventProcessor {
+        EventProcessor::new(ProcessorConfig {
+            customer_id: "customer".into(),
+            tenant_id: "tenant".into(),
+            source_id: "source".into(),
+            regional_cell_id: "cell".into(),
+            sensor_id: "sensor".into(),
+            node_name: "node".into(),
+            cluster_name: "cluster".into(),
+            host_proc: PathBuf::from("/definitely-not-proc"),
+            max_message_bytes: 1024 * 1024,
+            cpu_profile_hz: 0,
+            principal_hash_salt: Some("customer-salt".into()),
+            bulk_delete_threshold: 10,
+        })
+    }
+
+    fn test_raw(timestamp_ns: u64) -> KernelEvent {
+        let mut comm = [0u8; 16];
+        comm[..6].copy_from_slice(b"mongod");
+        KernelEvent {
+            timestamp_ns,
+            connection_key: 77,
+            cgroup_id: 88,
+            duration_ns: 0,
+            bytes: 0,
+            result: 0,
+            pid: 42,
+            tgid: 42,
+            uid: 999,
+            gid: 999,
+            fd: 9,
+            original_len: 0,
+            captured_len: 0,
+            event_type: EVENT_IO_CHUNK,
+            direction: 0,
+            source: 1,
+            operation: 0,
+            comm,
+            data: [0; MAX_CAPTURE_BYTES],
+        }
+    }
+
+    fn request_message(request_id: i32, command: MongoCommand) -> DecodedMessage {
+        DecodedMessage {
+            request_id,
+            response_to: 0,
+            wire_bytes: 128,
+            flags: 0,
+            more_to_come: false,
+            compressed: false,
+            command: Some(command),
+            status: None,
+        }
+    }
+
+    fn response_message(
+        request_id: i32,
+        response_to: i32,
+        affected_count: Option<u64>,
+        auth_done: Option<bool>,
+    ) -> DecodedMessage {
+        DecodedMessage {
+            request_id,
+            response_to,
+            wire_bytes: 96,
+            flags: 0,
+            more_to_come: false,
+            compressed: false,
+            command: None,
+            status: Some(mongo_protocol::ResponseStatus {
+                ok: Some(true),
+                code: None,
+                code_name: None,
+                affected_count,
+                auth_done,
+            }),
+        }
+    }
+
     #[test]
     fn kernel_event_layout_matches_bpf_structure() {
         assert_eq!(std::mem::size_of::<KernelEvent>(), 1120);
@@ -1050,11 +1241,102 @@ mod tests {
             collection: None,
             auth_mechanism: None,
             principal: Some("alice@example.com".into()),
+            speculative_auth: false,
+            delete_scope: None,
+            delete_statements: None,
         };
         let hashed = take_hashed_principal(&mut command, Some("customer-salt")).unwrap();
         assert!(hashed.starts_with("sha256:"));
         assert!(!hashed.contains("alice"));
         assert!(command.principal.is_none());
+    }
+
+    #[test]
+    fn attributes_bulk_delete_to_scram_principal_and_emits_finding() {
+        let mut processor = test_processor();
+        let speculative_hello = MongoCommand {
+            name: "hello".into(),
+            database: Some("admin".into()),
+            collection: None,
+            auth_mechanism: Some("SCRAM-SHA-256".into()),
+            principal: Some("alice".into()),
+            speculative_auth: true,
+            delete_scope: None,
+            delete_statements: None,
+        };
+        assert!(processor
+            .process_message(
+                test_raw(1_000),
+                false,
+                request_message(10, speculative_hello)
+            )
+            .is_empty());
+        processor.process_message(
+            test_raw(2_000),
+            false,
+            response_message(11, 10, None, Some(false)),
+        );
+
+        let sasl_continue = MongoCommand {
+            name: "saslContinue".into(),
+            database: Some("admin".into()),
+            collection: None,
+            auth_mechanism: None,
+            principal: None,
+            speculative_auth: false,
+            delete_scope: None,
+            delete_statements: None,
+        };
+        processor.process_message(test_raw(3_000), false, request_message(12, sasl_continue));
+        processor.process_message(
+            test_raw(4_000),
+            false,
+            response_message(13, 12, None, Some(true)),
+        );
+
+        let delete = MongoCommand {
+            name: "delete".into(),
+            database: Some("dam_demo".into()),
+            collection: Some("customer_records".into()),
+            auth_mechanism: None,
+            principal: None,
+            speculative_auth: false,
+            delete_scope: Some(DeleteScope::Multi),
+            delete_statements: Some(1),
+        };
+        processor.process_message(test_raw(5_000), false, request_message(14, delete));
+        let events = processor.process_message(
+            test_raw(10_005_000),
+            false,
+            response_message(15, 14, Some(35), None),
+        );
+
+        assert_eq!(events.len(), 2);
+        let expected_principal = hash_principal("customer-salt", "alice");
+        let activity = events.iter().find_map(|event| match &event.payload {
+            EventPayload::MongodbActivity(activity) => Some(activity),
+            _ => None,
+        });
+        let activity = activity.expect("MongoDB activity event");
+        assert_eq!(
+            activity.principal.as_deref(),
+            Some(expected_principal.as_str())
+        );
+        assert_eq!(activity.delete_scope.as_deref(), Some("multi"));
+        assert_eq!(activity.affected_documents, Some(35));
+
+        let finding = events.iter().find_map(|event| match &event.payload {
+            EventPayload::SecurityFinding(finding) => Some(finding),
+            _ => None,
+        });
+        let finding = finding.expect("bulk-delete security finding");
+        assert_eq!(finding.rule_id, "mongodb.bulk_delete");
+        assert_eq!(
+            finding.principal.as_deref(),
+            Some(expected_principal.as_str())
+        );
+        assert_eq!(finding.affected_documents, Some(35));
+        assert_eq!(finding.threshold_documents, 10);
     }
 
     #[test]

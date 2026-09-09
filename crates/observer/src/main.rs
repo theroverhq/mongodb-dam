@@ -106,6 +106,8 @@ struct Cli {
     max_message_bytes: usize,
     #[arg(long, env = "OBSERVER_CPU_PROFILE_HZ", default_value_t = 49)]
     cpu_profile_hz: u32,
+    #[arg(long, env = "OBSERVER_BULK_DELETE_THRESHOLD", default_value_t = 10)]
+    bulk_delete_threshold: u64,
     #[arg(long, env = "OBSERVER_MONGODB_PORT", default_value_t = 27017)]
     mongodb_port: u16,
     #[arg(long, env = "OBSERVER_TLS_UPROBES", value_enum, default_value = "auto")]
@@ -223,6 +225,7 @@ async fn main() -> Result<()> {
         max_message_bytes: cli.max_message_bytes,
         cpu_profile_hz: cli.cpu_profile_hz,
         principal_hash_salt,
+        bulk_delete_threshold: cli.bulk_delete_threshold,
     };
     let processor_task = tokio::spawn(async move {
         let mut processor = EventProcessor::new(processor_config);
@@ -362,6 +365,10 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         "cpu_profile_hz must be at most 999"
     );
     anyhow::ensure!(cli.mongodb_port > 0, "mongodb_port must be positive");
+    anyhow::ensure!(
+        cli.bulk_delete_threshold > 0,
+        "bulk_delete_threshold must be positive"
+    );
     Ok(())
 }
 

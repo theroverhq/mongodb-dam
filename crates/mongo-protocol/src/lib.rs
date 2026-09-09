@@ -31,6 +31,16 @@ pub struct MongoCommand {
     pub collection: Option<String>,
     pub auth_mechanism: Option<String>,
     pub principal: Option<String>,
+    pub speculative_auth: bool,
+    pub delete_scope: Option<DeleteScope>,
+    pub delete_statements: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteScope {
+    Single,
+    Multi,
+    Mixed,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +48,8 @@ pub struct ResponseStatus {
     pub ok: Option<bool>,
     pub code: Option<i32>,
     pub code_name: Option<String>,
+    pub affected_count: Option<u64>,
+    pub auth_done: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -286,6 +298,8 @@ fn decode_op_msg_prefix(
             ok: summary.ok,
             code: summary.code,
             code_name: summary.code_name,
+            affected_count: summary.affected_count,
+            auth_done: summary.auth_done,
         })
     } else {
         None
@@ -456,6 +470,9 @@ fn decoded_op_query(
             collection: namespace_collection,
             auth_mechanism: None,
             principal: None,
+            speculative_auth: false,
+            delete_scope: None,
+            delete_statements: None,
         })
     };
     DecodedMessage {
@@ -548,7 +565,9 @@ fn decoded_op_reply(
             .and_then(|value| value.ok)
             .or(Some(!failed)),
         code: summary.as_ref().and_then(|value| value.code),
-        code_name: summary.and_then(|value| value.code_name),
+        code_name: summary.as_ref().and_then(|value| value.code_name.clone()),
+        affected_count: summary.as_ref().and_then(|value| value.affected_count),
+        auth_done: summary.and_then(|value| value.auth_done),
     });
     DecodedMessage {
         request_id,
@@ -595,6 +614,7 @@ fn decode_op_msg(
     let end = payload.len() - checksum_bytes;
     let mut offset = 4;
     let mut summary = None;
+    let mut delete_sequence = None;
 
     while offset < end {
         let kind = payload[offset];
@@ -627,13 +647,28 @@ fn decode_op_msg(
                 if section_end > end {
                     return Err(DecodeError::InvalidBson);
                 }
+                let (identifier, documents_start) = read_cstring(payload, offset + 4)?;
+                if documents_start > section_end {
+                    return Err(DecodeError::InvalidBson);
+                }
+                if identifier == "deletes" {
+                    delete_sequence = Some(summarize_delete_document_sequence(
+                        payload
+                            .get(documents_start..section_end)
+                            .ok_or(DecodeError::InvalidBson)?,
+                    )?);
+                }
                 offset = section_end;
             }
             other => return Err(DecodeError::UnsupportedSection(other)),
         }
     }
 
-    let summary = summary.ok_or(DecodeError::InvalidBson)?;
+    let mut summary = summary.ok_or(DecodeError::InvalidBson)?;
+    if let Some((scope, statements)) = delete_sequence {
+        summary.delete_scope = scope;
+        summary.delete_statements = Some(statements);
+    }
     let command = if response_to == 0 {
         command_from_summary(&summary)
     } else {
@@ -644,6 +679,8 @@ fn decode_op_msg(
             ok: summary.ok,
             code: summary.code,
             code_name: summary.code_name,
+            affected_count: summary.affected_count,
+            auth_done: summary.auth_done,
         })
     } else {
         None
@@ -672,6 +709,11 @@ struct BsonSummary {
     code_name: Option<String>,
     auth_mechanism: Option<String>,
     principal: Option<String>,
+    speculative_auth: bool,
+    delete_scope: Option<DeleteScope>,
+    delete_statements: Option<u32>,
+    affected_count: Option<u64>,
+    auth_done: Option<bool>,
 }
 
 fn command_from_summary(summary: &BsonSummary) -> Option<MongoCommand> {
@@ -696,6 +738,13 @@ fn command_from_summary(summary: &BsonSummary) -> Option<MongoCommand> {
         collection,
         auth_mechanism: summary.auth_mechanism.clone(),
         principal,
+        speculative_auth: summary.speculative_auth,
+        delete_scope: (normalized == "delete")
+            .then_some(summary.delete_scope)
+            .flatten(),
+        delete_statements: (normalized == "delete")
+            .then_some(summary.delete_statements)
+            .flatten(),
     })
 }
 
@@ -746,6 +795,13 @@ fn command_has_principal_argument(command: &str) -> bool {
 }
 
 fn summarize_bson(document: &[u8]) -> Result<BsonSummary, DecodeError> {
+    summarize_bson_inner(document, true)
+}
+
+fn summarize_bson_inner(
+    document: &[u8],
+    allow_speculative_auth: bool,
+) -> Result<BsonSummary, DecodeError> {
     if document.len() < 5
         || read_i32(document, 0)? as usize != document.len()
         || document.last() != Some(&0)
@@ -781,6 +837,10 @@ fn summarize_bson(document: &[u8]) -> Result<BsonSummary, DecodeError> {
             }
             "ok" => summary.ok = read_boolish(document, value_start, element_type),
             "code" => summary.code = read_i32ish(document, value_start, element_type),
+            "n" => {
+                summary.affected_count = read_u64ish(document, value_start, element_type);
+            }
+            "done" => summary.auth_done = read_boolish(document, value_start, element_type),
             "codeName" if element_type == 0x02 => {
                 summary.code_name = read_bson_string(document, value_start).ok();
             }
@@ -795,6 +855,30 @@ fn summarize_bson(document: &[u8]) -> Result<BsonSummary, DecodeError> {
                     .ok()
                     .and_then(parse_scram_principal)
                     .or(summary.principal);
+            }
+            "speculativeAuthenticate" if allow_speculative_auth && element_type == 0x03 => {
+                if let Some(nested) = document
+                    .get(value_start..offset)
+                    .and_then(|value| summarize_bson_inner(value, false).ok())
+                {
+                    summary.speculative_auth = nested
+                        .first_key
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("saslStart"));
+                    summary.auth_mechanism = nested.auth_mechanism.or(summary.auth_mechanism);
+                    summary.principal = nested.principal.or(summary.principal);
+                    summary.auth_done = nested.auth_done.or(summary.auth_done);
+                }
+            }
+            "deletes" if element_type == 0x04 => {
+                if let Ok((scope, statements)) = summarize_delete_statements(
+                    document
+                        .get(value_start..offset)
+                        .ok_or(DecodeError::InvalidBson)?,
+                ) {
+                    summary.delete_scope = scope;
+                    summary.delete_statements = Some(statements);
+                }
             }
             _ => {}
         }
@@ -843,6 +927,10 @@ fn summarize_bson_prefix(document: &[u8]) -> Result<BsonSummary, DecodeError> {
             }
             "ok" => summary.ok = read_boolish(document, value_start, element_type),
             "code" => summary.code = read_i32ish(document, value_start, element_type),
+            "n" => {
+                summary.affected_count = read_u64ish(document, value_start, element_type);
+            }
+            "done" => summary.auth_done = read_boolish(document, value_start, element_type),
             "codeName" if element_type == 0x02 => {
                 summary.code_name = read_bson_string(document, value_start).ok();
             }
@@ -857,6 +945,32 @@ fn summarize_bson_prefix(document: &[u8]) -> Result<BsonSummary, DecodeError> {
                     .ok()
                     .and_then(parse_scram_principal)
                     .or(summary.principal);
+            }
+            "speculativeAuthenticate" if element_type == 0x03 => {
+                if let Ok(next) = next {
+                    if let Some(nested) = document
+                        .get(value_start..next)
+                        .and_then(|value| summarize_bson_inner(value, false).ok())
+                    {
+                        summary.speculative_auth = nested
+                            .first_key
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("saslStart"));
+                        summary.auth_mechanism = nested.auth_mechanism.or(summary.auth_mechanism);
+                        summary.principal = nested.principal.or(summary.principal);
+                        summary.auth_done = nested.auth_done.or(summary.auth_done);
+                    }
+                }
+            }
+            "deletes" if element_type == 0x04 => {
+                if let Ok(next) = next {
+                    if let Some(value) = document.get(value_start..next) {
+                        if let Ok((scope, statements)) = summarize_delete_statements(value) {
+                            summary.delete_scope = scope;
+                            summary.delete_statements = Some(statements);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -1017,6 +1131,123 @@ fn read_i32ish(bytes: &[u8], offset: usize, element_type: u8) -> Option<i32> {
     }
 }
 
+fn read_u64ish(bytes: &[u8], offset: usize, element_type: u8) -> Option<u64> {
+    match element_type {
+        0x10 => u64::try_from(read_i32(bytes, offset).ok()?).ok(),
+        0x12 => u64::try_from(i64::from_le_bytes(
+            bytes.get(offset..offset + 8)?.try_into().ok()?,
+        ))
+        .ok(),
+        0x01 => {
+            let value = f64::from_le_bytes(bytes.get(offset..offset + 8)?.try_into().ok()?);
+            if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64
+            {
+                Some(value as u64)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn summarize_delete_statements(array: &[u8]) -> Result<(Option<DeleteScope>, u32), DecodeError> {
+    if array.len() < 5 || read_i32(array, 0)? as usize != array.len() || array.last() != Some(&0) {
+        return Err(DecodeError::InvalidBson);
+    }
+
+    let mut offset = 4;
+    let mut statements = 0u32;
+    let mut has_single = false;
+    let mut has_multi = false;
+    while offset < array.len() - 1 {
+        let element_type = array[offset];
+        offset += 1;
+        let (_, after_key) = read_cstring(array, offset)?;
+        offset = after_key;
+        let value_start = offset;
+        offset = skip_value(array, offset, element_type)?;
+        if element_type != 0x03 {
+            continue;
+        }
+        statements = statements.saturating_add(1);
+        match delete_statement_limit(
+            array
+                .get(value_start..offset)
+                .ok_or(DecodeError::InvalidBson)?,
+        )? {
+            Some(0) => has_multi = true,
+            Some(1) => has_single = true,
+            _ => {}
+        }
+    }
+
+    let scope = match (has_single, has_multi) {
+        (true, true) => Some(DeleteScope::Mixed),
+        (true, false) => Some(DeleteScope::Single),
+        (false, true) => Some(DeleteScope::Multi),
+        (false, false) => None,
+    };
+    Ok((scope, statements))
+}
+
+fn summarize_delete_document_sequence(
+    documents: &[u8],
+) -> Result<(Option<DeleteScope>, u32), DecodeError> {
+    let mut offset = 0usize;
+    let mut statements = 0u32;
+    let mut has_single = false;
+    let mut has_multi = false;
+    while offset < documents.len() {
+        let length = read_i32(documents, offset)?;
+        if length < 5 {
+            return Err(DecodeError::InvalidBson);
+        }
+        let end = offset
+            .checked_add(length as usize)
+            .filter(|end| *end <= documents.len())
+            .ok_or(DecodeError::InvalidBson)?;
+        statements = statements.saturating_add(1);
+        match delete_statement_limit(&documents[offset..end])? {
+            Some(0) => has_multi = true,
+            Some(1) => has_single = true,
+            _ => {}
+        }
+        offset = end;
+    }
+
+    let scope = match (has_single, has_multi) {
+        (true, true) => Some(DeleteScope::Mixed),
+        (true, false) => Some(DeleteScope::Single),
+        (false, true) => Some(DeleteScope::Multi),
+        (false, false) => None,
+    };
+    Ok((scope, statements))
+}
+
+fn delete_statement_limit(statement: &[u8]) -> Result<Option<i32>, DecodeError> {
+    if statement.len() < 5
+        || read_i32(statement, 0)? as usize != statement.len()
+        || statement.last() != Some(&0)
+    {
+        return Err(DecodeError::InvalidBson);
+    }
+
+    let mut offset = 4;
+    while offset < statement.len() - 1 {
+        let element_type = statement[offset];
+        offset += 1;
+        let (key, after_key) = read_cstring(statement, offset)?;
+        offset = after_key;
+        let value_start = offset;
+        offset = skip_value(statement, offset, element_type)?;
+        if key == "limit" {
+            return Ok(read_i32ish(statement, value_start, element_type));
+        }
+    }
+    Ok(None)
+}
+
 fn read_cstring(bytes: &[u8], offset: usize) -> Result<(&str, usize), DecodeError> {
     let relative_end = bytes
         .get(offset..)
@@ -1079,11 +1310,27 @@ mod tests {
         bytes
     }
 
+    fn bool_element(key: &str, value: bool) -> Vec<u8> {
+        let mut bytes = vec![0x08];
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+        bytes.push(u8::from(value));
+        bytes
+    }
+
     fn binary_element(key: &str, value: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0x05];
         bytes.extend_from_slice(key.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&(value.len() as i32).to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
+    fn embedded_element(element_type: u8, key: &str, value: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![element_type];
+        bytes.extend_from_slice(key.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(value);
         bytes
@@ -1107,6 +1354,32 @@ mod tests {
         let mut frame = ((16 + payload.len()) as i32).to_le_bytes().to_vec();
         frame.extend_from_slice(&request_id.to_le_bytes());
         frame.extend_from_slice(&response_to.to_le_bytes());
+        frame.extend_from_slice(&OP_MSG.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    fn op_msg_with_document_sequence(
+        request_id: i32,
+        body: Vec<u8>,
+        identifier: &str,
+        documents: Vec<Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut payload = 0u32.to_le_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(&body);
+        payload.push(1);
+        let documents_len = documents.iter().map(Vec::len).sum::<usize>();
+        let section_size = 4 + identifier.len() + 1 + documents_len;
+        payload.extend_from_slice(&(section_size as i32).to_le_bytes());
+        payload.extend_from_slice(identifier.as_bytes());
+        payload.push(0);
+        for document in documents {
+            payload.extend_from_slice(&document);
+        }
+        let mut frame = ((16 + payload.len()) as i32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&request_id.to_le_bytes());
+        frame.extend_from_slice(&0i32.to_le_bytes());
         frame.extend_from_slice(&OP_MSG.to_le_bytes());
         frame.extend_from_slice(&payload);
         frame
@@ -1161,8 +1434,84 @@ mod tests {
                 collection: Some("orders".into()),
                 auth_mechanism: None,
                 principal: None,
+                speculative_auth: false,
+                delete_scope: None,
+                delete_statements: None,
             })
         );
+    }
+
+    #[test]
+    fn extracts_bulk_delete_scope_and_affected_count_without_filter_values() {
+        let private_filter = document(vec![string_element(
+            "customer_email",
+            "private@example.invalid",
+        )]);
+        let statement = document(vec![
+            embedded_element(0x03, "q", &private_filter),
+            int_element("limit", 0),
+        ]);
+        let statements = document(vec![embedded_element(0x03, "0", &statement)]);
+        let request = op_msg(
+            61,
+            0,
+            0,
+            document(vec![
+                string_element("delete", "customer_records"),
+                embedded_element(0x04, "deletes", &statements),
+                string_element("$db", "dam_demo"),
+            ]),
+        );
+        let command = decode_frame(&request, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .command
+            .unwrap();
+
+        assert_eq!(command.name, "delete");
+        assert_eq!(command.database.as_deref(), Some("dam_demo"));
+        assert_eq!(command.collection.as_deref(), Some("customer_records"));
+        assert_eq!(command.delete_scope, Some(DeleteScope::Multi));
+        assert_eq!(command.delete_statements, Some(1));
+        assert!(!format!("{command:?}").contains("private@example.invalid"));
+
+        let response = op_msg(
+            62,
+            61,
+            0,
+            document(vec![int_element("n", 35), double_element("ok", 1.0)]),
+        );
+        let status = decode_frame(&response, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(status.affected_count, Some(35));
+        assert_eq!(status.ok, Some(true));
+    }
+
+    #[test]
+    fn extracts_bulk_delete_from_op_msg_document_sequence() {
+        let private_filter = document(vec![string_element("tenant", "private-tenant")]);
+        let statement = document(vec![
+            embedded_element(0x03, "q", &private_filter),
+            int_element("limit", 0),
+        ]);
+        let request = op_msg_with_document_sequence(
+            63,
+            document(vec![
+                string_element("delete", "customer_records"),
+                string_element("$db", "dam_demo"),
+            ]),
+            "deletes",
+            vec![statement],
+        );
+        let command = decode_frame(&request, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .command
+            .unwrap();
+
+        assert_eq!(command.delete_scope, Some(DeleteScope::Multi));
+        assert_eq!(command.delete_statements, Some(1));
+        assert!(!format!("{command:?}").contains("private-tenant"));
     }
 
     #[test]
@@ -1200,6 +1549,53 @@ mod tests {
         assert_eq!(command.name, "saslStart");
         assert_eq!(command.auth_mechanism.as_deref(), Some("SCRAM-SHA-256"));
         assert_eq!(command.principal.as_deref(), Some("alice,ops"));
+    }
+
+    #[test]
+    fn extracts_speculative_scram_principal_and_completion_state() {
+        let speculative_request = document(vec![
+            int_element("saslStart", 1),
+            string_element("mechanism", "SCRAM-SHA-256"),
+            binary_element("payload", b"n,,n=alice,r=client-nonce"),
+        ]);
+        let request = op_msg(
+            47,
+            0,
+            0,
+            document(vec![
+                int_element("hello", 1),
+                embedded_element(0x03, "speculativeAuthenticate", &speculative_request),
+                string_element("$db", "admin"),
+            ]),
+        );
+        let command = decode_frame(&request, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .command
+            .unwrap();
+        assert_eq!(command.name, "hello");
+        assert!(command.speculative_auth);
+        assert_eq!(command.principal.as_deref(), Some("alice"));
+        assert_eq!(command.auth_mechanism.as_deref(), Some("SCRAM-SHA-256"));
+
+        let speculative_response = document(vec![
+            int_element("conversationId", 1),
+            bool_element("done", false),
+            double_element("ok", 1.0),
+        ]);
+        let response = op_msg(
+            48,
+            47,
+            0,
+            document(vec![
+                double_element("ok", 1.0),
+                embedded_element(0x03, "speculativeAuthenticate", &speculative_response),
+            ]),
+        );
+        let status = decode_frame(&response, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(status.auth_done, Some(false));
     }
 
     #[test]
@@ -1339,6 +1735,8 @@ mod tests {
                 ok: Some(false),
                 code: Some(13),
                 code_name: Some("Unauthorized".into()),
+                affected_count: None,
+                auth_done: None,
             })
         );
     }

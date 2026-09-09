@@ -68,6 +68,7 @@ class DemoApplication:
         self.database = self.client[database_name]
         self.customers = self.database["customers"]
         self.orders = self.database["orders"]
+        self.customer_records = self.database["customer_records"]
 
     def health(self) -> dict[str, Any]:
         self.client.admin.command("ping")
@@ -92,18 +93,33 @@ class DemoApplication:
             {"_id": "order-1007", "customer_id": "cust-005", "product": "dam-starter", "amount": 299.00, "status": "shipped", "created_at": now},
             {"_id": "order-1008", "customer_id": "cust-005", "product": "vector-search-demo", "amount": 149.00, "status": "paid", "created_at": now},
         ]
+        customer_records = [
+            {
+                "_id": f"demo-record-{index:03d}",
+                "demo_batch": "iam-bulk-delete",
+                "owner": f"dummy-user-{index:03d}@example.test",
+                "classification": "demo-confidential",
+                "created_at": now,
+            }
+            for index in range(1, 36)
+        ]
 
         self.orders.delete_many({})
         self.customers.delete_many({})
+        # Drop/recreate makes reseeding deterministic without generating a
+        # misleading bulk-delete finding for the privileged demo API itself.
+        self.customer_records.drop()
         self.customers.create_index([("email", ASCENDING)], unique=True)
         self.orders.create_index([("customer_id", ASCENDING), ("status", ASCENDING)])
         self.customers.insert_many(customers)
         self.orders.insert_many(orders)
+        self.customer_records.insert_many(customer_records)
         return {
             "status": "seeded",
             "database": self.database.name,
             "customers": len(customers),
             "orders": len(orders),
+            "customer_records": len(customer_records),
         }
 
     def list_customers(self, email: str | None) -> list[dict[str, Any]]:

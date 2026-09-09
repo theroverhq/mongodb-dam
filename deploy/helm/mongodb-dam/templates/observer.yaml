@@ -64,6 +64,8 @@ spec:
               value: {{ int64 .Values.observer.cpuProfileHz | quote }}
             - name: OBSERVER_MONGODB_PORT
               value: {{ int64 .Values.observer.mongodbPort | quote }}
+            - name: OBSERVER_BULK_DELETE_THRESHOLD
+              value: {{ int64 .Values.observer.bulkDeleteThreshold | quote }}
             - name: OBSERVER_TLS_UPROBES
               value: {{ .Values.observer.tlsUprobes | quote }}
             - name: OBSERVER_LOCK_PROFILING

@@ -8,6 +8,8 @@
 - Plaintext UDP DNS queries and responses from MongoDB processes now produce metadata-only events with correlation latency.
 - TCP lifecycle coverage now includes handshake-established events and duration when a start transition is observable, peer versus active reset direction, zero-window signals, and state-derived `ETIMEDOUT` events in addition to connect, accept, close, retransmit, and sampled SRTT.
 - TLS discovery now checks both OpenSSL and BoringSSL mappings and falls back to exported `SSL_*` symbols in the MongoDB executable for compatible static linking.
+- SCRAM identities, including modern speculative authentication in `hello`, are correlated to later commands on the same physical connection as salted hashes.
+- Delete command arrays and OP_MSG document sequences are classified as single, multi, or mixed; response counts can produce the node-local `mongodb.bulk_delete` finding.
 
 ## Remaining capture boundaries
 
@@ -48,6 +50,7 @@
 
 - Command does not yet model `http_push` or `mongodb_dam` sources.
 - The configured regional endpoint does not yet provide the production credential assignment, durable idempotency store, or downstream mapping into Collect. That integration is deliberately outside this customer-side repository and is the next phase.
-- Regional querying, alert rules, retention, RBAC, audit evidence, dashboards, symbol storage, and flamegraph construction remain to be built.
+- Regional querying, configurable rule management beyond the built-in bulk-delete demo rule, retention, RBAC, audit evidence, dashboards, symbol storage, and flamegraph construction remain to be built.
+- The direct-user demo maps an AWS IAM ARN to a MongoDB Community SCRAM credential through Secrets Manager. It is not native `MONGODB-AWS`, its clear identity join remains demo-local, and containment is operator-triggered after the destructive operation.
 - There is no operator-managed MongoDB topology here. The bundled Community database is one standalone StatefulSet for product validation, not a production replica set, backup, restore, or upgrade solution.
 - Generic HTTP/1.1, HTTP/2, gRPC, AI-service signature matching, and vector-database protocol classification are not part of this MongoDB DAM sensor. Adding them would be a separate source type with separate privacy and protocol contracts.

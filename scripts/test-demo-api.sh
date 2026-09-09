@@ -66,7 +66,8 @@ done
 curl --fail --silent "http://127.0.0.1:$port/health" >/dev/null
 
 seed="$(curl --fail --silent --request POST "http://127.0.0.1:$port/demo/seed")"
-jq -e '.status == "seeded" and .customers == 5 and .orders == 8' <<<"$seed" >/dev/null
+jq -e '.status == "seeded" and .customers == 5 and .orders == 8 and .customer_records == 35' \
+  <<<"$seed" >/dev/null
 customers="$(curl --fail --silent "http://127.0.0.1:$port/customers?email=aarav%40example.test")"
 jq -e '.customers | length == 1' <<<"$customers" >/dev/null
 workload="$(curl --fail --silent --request POST "http://127.0.0.1:$port/demo/workload")"

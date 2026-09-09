@@ -158,6 +158,7 @@ pub enum EventPayload {
     MongodbActivity(MongodbActivity),
     MongodbConnection(MongodbConnection),
     MongodbAuth(MongodbAuth),
+    SecurityFinding(SecurityFinding),
     DnsActivity(DnsActivity),
     HostIo(HostIo),
     Profile(ProfileSample),
@@ -199,6 +200,16 @@ pub struct MongodbActivity {
     pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(default)]
+    pub principal_hashed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_statements: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected_documents: Option<u64>,
     pub request_id: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<i32>,
@@ -238,6 +249,29 @@ pub struct MongodbAuth {
     pub principal_hashed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub succeeded: Option<bool>,
+    pub connection_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityFinding {
+    pub rule_id: String,
+    pub severity: String,
+    pub title: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub principal_hashed: bool,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected_documents: Option<u64>,
+    pub threshold_documents: u64,
     pub connection_id: String,
 }
 
@@ -336,6 +370,11 @@ mod tests {
                 command: "find".into(),
                 database: Some("sales".into()),
                 collection: Some("orders".into()),
+                principal: Some("sha256:redacted".into()),
+                principal_hashed: true,
+                delete_scope: None,
+                delete_statements: None,
+                affected_documents: None,
                 request_id: 7,
                 response_id: Some(8),
                 request_bytes: 64,

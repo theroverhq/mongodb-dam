@@ -16,6 +16,8 @@ Headers:
 
 Body: one `DamBatch` from `crates/schema`, with `schema_version: 1`. Identity fields are repeated on the batch and every event so the regional ingress can reject cross-customer or cross-source injection before persistence or forwarding.
 
+MongoDB activity may include an optional salted `principal`, `delete_scope`, `delete_statements`, and `affected_documents`. A node-local `mongodb.bulk_delete` rule emits a `security_finding` event with the same hashed principal, target namespace, affected count, configured threshold, severity, and connection ID. Clear usernames, IAM ARNs, query predicates, and document bodies are not part of the HTTP-push contract; any IAM display name must come from a separately authorized identity registry.
+
 ## Required receiver behavior
 
 1. Authenticate the source credential and resolve it to exactly one customer, tenant, source, and regional cell assignment.

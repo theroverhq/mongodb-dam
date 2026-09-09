@@ -59,7 +59,7 @@ Keep this port-forward running in terminal 1:
 kubectl -n mongodb-dam port-forward service/mongodb-dam-demo-api 8080:8080
 ```
 
-From terminal 2, reset and seed the `dam_demo` database with five customers and eight orders:
+From terminal 2, reset and seed the `dam_demo` database with five customers, eight orders, and 35 disposable records for the direct-user bulk-delete scenario:
 
 ```bash
 curl --fail --silent --show-error \
@@ -69,10 +69,12 @@ curl --fail --silent --show-error \
 Expected summary:
 
 ```json
-{"status":"seeded","database":"dam_demo","customers":5,"orders":8}
+{"status":"seeded","database":"dam_demo","customers":5,"orders":8,"customer_records":35}
 ```
 
 The dummy values use the reserved `.test` domain and are not real customer data.
+
+For the AWS IAM-mapped direct `mongosh` attack, critical finding, containment, and denied-query proof, follow the complete final section of the repository [README](../README.md#exact-aws-iam-user--direct-mongodb-bulk-delete--flag--block-demo).
 
 ## 2. Execute queries over HTTP from the client machine
 

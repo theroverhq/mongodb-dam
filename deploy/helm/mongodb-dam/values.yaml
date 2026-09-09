@@ -60,6 +60,9 @@ mongodb:
 
 observer:
   mongodbPort: 27017
+  # Emit a critical mongodb.bulk_delete finding when a multi-delete affects
+  # at least this many documents.
+  bulkDeleteThreshold: 10
   cpuProfileHz: 49
   tlsUprobes: auto
   lockProfiling: true
