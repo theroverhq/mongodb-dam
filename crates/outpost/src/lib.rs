@@ -10,7 +10,7 @@ use axum::{
 use dam_schema::{DamBatch, KubernetesMetadata};
 use dam_spool::DurableSpool;
 use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
-use reqwest::{Certificate, Client, Url};
+use reqwest::{redirect::Policy, Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -30,11 +30,9 @@ pub struct OutpostConfig {
     pub regional_cell_id: String,
     pub cluster_name: String,
     pub internal_token: Option<String>,
-    pub collect_url: String,
-    pub collect_token: String,
-    pub collect_ca_file: Option<PathBuf>,
-    pub collect_token_header: String,
-    pub idempotency_header: String,
+    pub endpoint: String,
+    pub bearer_token: String,
+    pub ca_file: Option<PathBuf>,
     pub spool_dir: PathBuf,
     pub spool_max_bytes: u64,
     pub max_request_bytes: usize,
@@ -185,24 +183,24 @@ fn validate_config(config: &OutpostConfig) -> Result<()> {
         ("source_id", config.source_id.as_str()),
         ("regional_cell_id", config.regional_cell_id.as_str()),
         ("cluster_name", config.cluster_name.as_str()),
-        ("collect_url", config.collect_url.as_str()),
-        ("collect_token", config.collect_token.as_str()),
+        ("endpoint", config.endpoint.as_str()),
+        ("bearer_token", config.bearer_token.as_str()),
     ] {
         anyhow::ensure!(!value.trim().is_empty(), "{name} must not be empty");
     }
-    let collect_url = Url::parse(&config.collect_url).context("collect_url is invalid")?;
-    let is_local_mock = collect_url.scheme() == "http"
+    let endpoint = Url::parse(&config.endpoint).context("endpoint is invalid")?;
+    let is_local_mock = endpoint.scheme() == "http"
         && matches!(
-            collect_url.host_str(),
-            Some("127.0.0.1" | "localhost" | "mock-collect")
+            endpoint.host_str(),
+            Some("127.0.0.1" | "localhost" | "mock-endpoint")
         );
     anyhow::ensure!(
-        collect_url.scheme() == "https" || is_local_mock,
-        "collect_url must use HTTPS except for the bundled local mock"
+        endpoint.scheme() == "https" || is_local_mock,
+        "endpoint must use HTTPS except for the bundled local mock"
     );
     anyhow::ensure!(
-        collect_url.username().is_empty() && collect_url.password().is_none(),
-        "collect_url must not contain credentials"
+        endpoint.username().is_empty() && endpoint.password().is_none(),
+        "endpoint must not contain credentials"
     );
     anyhow::ensure!(
         config.max_request_bytes > 0,
@@ -406,7 +404,7 @@ async fn run_exporter(state: AppState) {
     let client = match regional_client(&state.config) {
         Ok(client) => client,
         Err(error) => {
-            error!(error = ?error, "failed to build regional HTTP client");
+            error!(error = ?error, "failed to build destination HTTP client");
             return;
         }
     };
@@ -414,7 +412,7 @@ async fn run_exporter(state: AppState) {
     loop {
         if let Err(error) = deliver_pending(&state, &client).await {
             state.metrics.delivery_failures.inc();
-            warn!(error = ?error, "regional batch delivery pass failed");
+            warn!(error = ?error, "destination batch delivery pass failed");
         }
         refresh_spool_metrics(&state);
         tokio::select! {
@@ -427,13 +425,14 @@ async fn run_exporter(state: AppState) {
 fn regional_client(config: &OutpostConfig) -> Result<Client> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30));
-    if let Some(path) = &config.collect_ca_file {
-        let pem = fs::read(path)
-            .with_context(|| format!("reading regional Collect CA {}", path.display()))?;
-        builder = builder.add_root_certificate(
-            Certificate::from_pem(&pem).context("parsing regional Collect CA")?,
-        );
+        .timeout(Duration::from_secs(30))
+        // Never forward the source bearer credential to a redirected origin.
+        .redirect(Policy::none());
+    if let Some(path) = &config.ca_file {
+        let pem =
+            fs::read(path).with_context(|| format!("reading destination CA {}", path.display()))?;
+        builder = builder
+            .add_root_certificate(Certificate::from_pem(&pem).context("parsing destination CA")?);
     }
     builder.build().context("building regional HTTP client")
 }
@@ -444,13 +443,10 @@ async fn deliver_pending(state: &AppState, client: &Client) -> Result<()> {
         let batch: DamBatch = serde_json::from_slice(&body)
             .with_context(|| format!("spooled batch {} is invalid", item.id))?;
         let response = client
-            .post(&state.config.collect_url)
+            .post(&state.config.endpoint)
             .header("content-type", "application/json")
-            .header(
-                &state.config.collect_token_header,
-                &state.config.collect_token,
-            )
-            .header(&state.config.idempotency_header, &batch.batch_id)
+            .bearer_auth(&state.config.bearer_token)
+            .header("idempotency-key", &batch.batch_id)
             .body(body)
             .send()
             .await
@@ -591,7 +587,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_non_tls_remote_collect_url() {
+    fn rejects_non_tls_remote_endpoint() {
         let config = OutpostConfig {
             customer_id: "customer".into(),
             tenant_id: "tenant".into(),
@@ -599,11 +595,9 @@ mod tests {
             regional_cell_id: "cell".into(),
             cluster_name: "cluster".into(),
             internal_token: None,
-            collect_url: "http://remote.example/ingest".into(),
-            collect_token: "token".into(),
-            collect_ca_file: None,
-            collect_token_header: "x-rover-collect-token".into(),
-            idempotency_header: "idempotency-key".into(),
+            endpoint: "http://remote.example/ingest".into(),
+            bearer_token: "token".into(),
+            ca_file: None,
             spool_dir: PathBuf::from("/tmp/not-used"),
             spool_max_bytes: 1024,
             max_request_bytes: 1024,
@@ -616,8 +610,8 @@ mod tests {
         assert!(validate_config(&config).is_err());
 
         let mut prefixed_mock = config;
-        prefixed_mock.collect_url =
-            "http://mock-collect.attacker.example/v1/ingest/mongodb-dam".into();
+        prefixed_mock.endpoint =
+            "http://mock-endpoint.attacker.example/v1/ingest/mongodb-dam".into();
         assert!(validate_config(&prefixed_mock).is_err());
     }
 }

@@ -71,25 +71,21 @@ spec:
               value: {{ required "assignment.clusterName is required" .Values.assignment.clusterName | quote }}
             - name: OUTPOST_INTERNAL_TOKEN_FILE
               value: /var/run/mongodb-dam/secrets/observer-internal-token
-            - name: OUTPOST_COLLECT_URL
-              value: {{ required "collect.url is required" .Values.collect.url | quote }}
-            - name: OUTPOST_COLLECT_TOKEN_FILE
-              value: /var/run/mongodb-dam/secrets/collect-token
-            - name: OUTPOST_COLLECT_TOKEN_HEADER
-              value: {{ .Values.collect.tokenHeader | quote }}
-            - name: OUTPOST_IDEMPOTENCY_HEADER
-              value: {{ .Values.collect.idempotencyHeader | quote }}
+            - name: OUTPOST_ENDPOINT
+              value: {{ required "destination.endpoint is required" .Values.destination.endpoint | quote }}
+            - name: OUTPOST_BEARER_TOKEN_FILE
+              value: /var/run/mongodb-dam/secrets/bearer-token
             - name: OUTPOST_SPOOL_MAX_BYTES
-              value: {{ .Values.outpost.spoolMaxBytes | quote }}
+              value: {{ int64 .Values.outpost.spoolMaxBytes | quote }}
             - name: OUTPOST_MAX_REQUEST_BYTES
-              value: {{ .Values.outpost.maxRequestBytes | quote }}
+              value: {{ int64 .Values.outpost.maxRequestBytes | quote }}
             - name: KUBERNETES_SERVICE_HOST
               value: kubernetes.default.svc
             - name: KUBERNETES_SERVICE_PORT_HTTPS
               value: "443"
-            {{- if .Values.collect.caSecretName }}
-            - name: OUTPOST_COLLECT_CA_FILE
-              value: /var/run/mongodb-dam/collect-ca/{{ .Values.collect.caSecretKey }}
+            {{- if .Values.destination.caSecretName }}
+            - name: OUTPOST_CA_FILE
+              value: /var/run/mongodb-dam/destination-ca/{{ .Values.destination.caSecretKey }}
             {{- end }}
           ports:
             - name: http
@@ -116,9 +112,9 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.collect.caSecretName }}
-            - name: collect-ca
-              mountPath: /var/run/mongodb-dam/collect-ca
+            {{- if .Values.destination.caSecretName }}
+            - name: destination-ca
+              mountPath: /var/run/mongodb-dam/destination-ca
               readOnly: true
             {{- end }}
       volumes:
@@ -135,17 +131,17 @@ spec:
             items:
               - key: observer-internal-token
                 path: observer-internal-token
-              - key: collect-token
-                path: collect-token
+              - key: bearer-token
+                path: bearer-token
         - name: tmp
           emptyDir: {}
-        {{- if .Values.collect.caSecretName }}
-        - name: collect-ca
+        {{- if .Values.destination.caSecretName }}
+        - name: destination-ca
           secret:
-            secretName: {{ .Values.collect.caSecretName }}
+            secretName: {{ .Values.destination.caSecretName }}
             items:
-              - key: {{ .Values.collect.caSecretKey }}
-                path: {{ .Values.collect.caSecretKey }}
+              - key: {{ .Values.destination.caSecretKey }}
+                path: {{ .Values.destination.caSecretKey }}
         {{- end }}
       {{- with .Values.outpost.nodeSelector }}
       nodeSelector:

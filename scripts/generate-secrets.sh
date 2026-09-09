@@ -12,13 +12,13 @@ fi
 umask 077
 mkdir -p "$(dirname "$output")"
 observer_token="$(openssl rand -hex 32)"
-collect_token="$(openssl rand -hex 32)"
+bearer_token="$(openssl rand -hex 32)"
 principal_salt="$(openssl rand -hex 32)"
 mongodb_password="$(openssl rand -base64 32 | tr -d '\n')"
 
 {
   printf 'OBSERVER_INTERNAL_TOKEN=%q\n' "$observer_token"
-  printf 'COLLECT_TOKEN=%q\n' "$collect_token"
+  printf 'BEARER_TOKEN=%q\n' "$bearer_token"
   printf 'PRINCIPAL_HASH_SALT=%q\n' "$principal_salt"
   printf 'MONGODB_ROOT_USERNAME=%q\n' 'dam-admin'
   printf 'MONGODB_ROOT_PASSWORD=%q\n' "$mongodb_password"
@@ -26,4 +26,4 @@ mongodb_password="$(openssl rand -base64 32 | tr -d '\n')"
 
 chmod 600 "$output"
 printf 'Wrote local secret environment file (mode 0600): %s\n' "$output"
-printf '%s\n' 'The generated COLLECT_TOKEN must also be provisioned in the regional cell.'
+printf '%s\n' 'The generated BEARER_TOKEN must also be provisioned at the regional endpoint.'

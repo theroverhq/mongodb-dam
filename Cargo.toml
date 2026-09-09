@@ -5,7 +5,7 @@ members = [
     "crates/spool",
     "crates/observer",
     "crates/outpost",
-    "crates/mock-collect",
+    "crates/mock-endpoint",
 ]
 resolver = "2"
 

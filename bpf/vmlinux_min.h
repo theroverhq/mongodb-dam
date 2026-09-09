@@ -46,10 +46,6 @@ struct user_pt_regs {
 };
 #endif
 
-typedef struct {
-    __s64 counter;
-} atomic64_t;
-
 struct in6_addr {
     union {
         __u8 u6_addr8[16];
@@ -65,17 +61,18 @@ struct sock_common {
     __u16 skc_family;
     struct in6_addr skc_v6_daddr;
     struct in6_addr skc_v6_rcv_saddr;
-    atomic64_t skc_cookie;
 } __attribute__((preserve_access_index));
 
 struct sock {
     struct sock_common __sk_common;
+    int sk_err;
 } __attribute__((preserve_access_index));
 struct sk_buff;
 struct bpf_perf_event_data;
 
 struct tcp_sock {
     __u32 srtt_us;
+    __u32 snd_wnd;
 } __attribute__((preserve_access_index));
 
 enum bpf_map_type {

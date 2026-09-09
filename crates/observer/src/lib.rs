@@ -1,7 +1,7 @@
 use dam_schema::{
-    CaptureConfidence, CaptureMetadata, CaptureSource, ConnectionMetadata, DamEvent, EventPayload,
-    HostIo, KubernetesMetadata, MongodbActivity, MongodbAuth, MongodbConnection, NetworkEndpoint,
-    ProcessLifecycle, ProcessMetadata, ProfileSample, EVENT_SCHEMA_VERSION,
+    CaptureConfidence, CaptureMetadata, CaptureSource, ConnectionMetadata, DamEvent, DnsActivity,
+    EventPayload, HostIo, KubernetesMetadata, MongodbActivity, MongodbAuth, MongodbConnection,
+    NetworkEndpoint, ProcessLifecycle, ProcessMetadata, ProfileSample, EVENT_SCHEMA_VERSION,
 };
 use mongo_protocol::{DecodedMessage, DecoderConfig, MongoCommand, StreamDecoder};
 use sha2::{Digest, Sha256};
@@ -15,12 +15,15 @@ use std::{
 use time::OffsetDateTime;
 
 pub const MAX_CAPTURE_BYTES: usize = 1024;
+const MAX_PENDING_REQUESTS: usize = 32_768;
+const PENDING_REQUEST_TTL_NS: u64 = 300_000_000_000;
 
 pub const EVENT_IO_CHUNK: u8 = 1;
 pub const EVENT_SYSCALL_LATENCY: u8 = 2;
 pub const EVENT_CONNECTION: u8 = 3;
 pub const EVENT_PROFILE: u8 = 4;
 pub const EVENT_PROCESS: u8 = 5;
+pub const EVENT_DNS_CHUNK: u8 = 6;
 
 pub const OP_PREAD: u8 = 1;
 pub const OP_PWRITE: u8 = 2;
@@ -38,6 +41,11 @@ pub const OP_LOCK_WAIT: u8 = 13;
 pub const OP_PAGE_FAULT: u8 = 14;
 pub const OP_PROCESS_EXEC: u8 = 15;
 pub const OP_PROCESS_EXIT: u8 = 16;
+pub const OP_TCP_HANDSHAKE: u8 = 17;
+pub const OP_TCP_RESET_RECEIVED: u8 = 18;
+pub const OP_TCP_RESET_SENT: u8 = 19;
+pub const OP_TCP_ZERO_WINDOW: u8 = 20;
+pub const OP_TCP_TIMEOUT: u8 = 21;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -117,12 +125,19 @@ struct EventSeed {
 #[derive(Clone)]
 struct PendingRequest {
     command: MongoCommand,
+    principal_hash: Option<String>,
     request_id: i32,
     request_bytes: u32,
     compressed: bool,
     expects_response: bool,
     seed: EventSeed,
     connection: ConnectionMetadata,
+}
+
+struct PendingDnsQuery {
+    timestamp_ns: u64,
+    name: Option<String>,
+    record_type: Option<String>,
 }
 
 #[derive(Default)]
@@ -141,6 +156,7 @@ pub struct EventProcessor {
     config: ProcessorConfig,
     streams: HashMap<(u32, u64, u8), StreamDecoder>,
     pending: HashMap<(u32, u64, i32), PendingRequest>,
+    pending_dns: HashMap<(u32, u64, u16), PendingDnsQuery>,
     connections: HashMap<(u32, u64), ConnectionState>,
     endpoint_cache: HashMap<(u32, i32), EndpointCacheEntry>,
     sequence: u64,
@@ -152,6 +168,7 @@ impl EventProcessor {
             config,
             streams: HashMap::new(),
             pending: HashMap::new(),
+            pending_dns: HashMap::new(),
             connections: HashMap::new(),
             endpoint_cache: HashMap::new(),
             sequence: 0,
@@ -165,6 +182,7 @@ impl EventProcessor {
             EVENT_CONNECTION => Ok(self.process_connection(captured)),
             EVENT_PROFILE => Ok(self.process_profile(captured)),
             EVENT_PROCESS => Ok(self.process_lifecycle(captured)),
+            EVENT_DNS_CHUNK => self.process_dns(captured),
             other => Err(format!("unsupported kernel event type {other}")),
         }
     }
@@ -180,22 +198,23 @@ impl EventProcessor {
         let key = (raw.tgid, raw.connection_key, raw.direction);
         let decoder_config = DecoderConfig {
             max_message_bytes: self.config.max_message_bytes,
-            max_buffer_bytes: self.config.max_message_bytes.saturating_mul(2),
+            max_buffer_bytes: MAX_CAPTURE_BYTES.saturating_mul(2),
         };
         let truncated = raw.bytes > raw.captured_len as u64;
         let decoded = if truncated {
-            let result = self
+            let decoder = self
                 .streams
                 .entry(key)
-                .or_insert_with(|| StreamDecoder::new(decoder_config))
-                .push_truncated(&raw.data[..captured_len]);
+                .or_insert_with(|| StreamDecoder::new(decoder_config));
+            let remaining = MAX_CAPTURE_BYTES.saturating_sub(decoder.buffered_bytes());
+            let result = decoder.push_truncated(&raw.data[..captured_len.min(remaining)]);
             self.streams.remove(&key);
             vec![result.map_err(|error| error.to_string())?]
         } else {
             self.streams
                 .entry(key)
                 .or_insert_with(|| StreamDecoder::new(decoder_config))
-                .push(&raw.data[..captured_len])
+                .push_bounded_prefix(&raw.data[..captured_len], MAX_CAPTURE_BYTES)
                 .map_err(|error| {
                     self.streams.remove(&key);
                     error.to_string()
@@ -209,6 +228,68 @@ impl EventProcessor {
         Ok(events)
     }
 
+    fn process_dns(&mut self, captured: CapturedKernelEvent) -> Result<Vec<DamEvent>, String> {
+        let raw = captured.raw;
+        let captured_len = usize::try_from(raw.captured_len)
+            .unwrap_or(usize::MAX)
+            .min(MAX_CAPTURE_BYTES);
+        let message = decode_dns_message(&raw.data[..captured_len])?;
+        let key = (raw.tgid, raw.connection_key, message.query_id);
+        let truncated = raw.bytes > raw.captured_len as u64;
+
+        let (operation, name, record_type, duration_us) = if message.response {
+            let pending = self.pending_dns.remove(&key);
+            let duration = pending
+                .as_ref()
+                .map(|pending| raw.timestamp_ns.saturating_sub(pending.timestamp_ns) / 1_000);
+            (
+                "response",
+                message
+                    .name
+                    .or_else(|| pending.as_ref().and_then(|value| value.name.clone())),
+                message
+                    .record_type
+                    .or_else(|| pending.as_ref().and_then(|value| value.record_type.clone())),
+                duration,
+            )
+        } else {
+            if self.pending_dns.len() >= 4_096 {
+                let cutoff = raw.timestamp_ns.saturating_sub(30_000_000_000);
+                self.pending_dns
+                    .retain(|_, pending| pending.timestamp_ns >= cutoff);
+                if self.pending_dns.len() >= 4_096 {
+                    self.pending_dns.clear();
+                }
+            }
+            self.pending_dns.insert(
+                key,
+                PendingDnsQuery {
+                    timestamp_ns: raw.timestamp_ns,
+                    name: message.name.clone(),
+                    record_type: message.record_type.clone(),
+                },
+            );
+            ("query", message.name, message.record_type, None)
+        };
+
+        let connection = self.connection_metadata(&raw);
+        Ok(vec![self.event(
+            &raw,
+            truncated,
+            EventPayload::DnsActivity(DnsActivity {
+                operation: operation.into(),
+                transport: "udp".into(),
+                query_id: message.query_id,
+                name,
+                record_type,
+                response_code: message.response.then_some(message.response_code),
+                answer_count: message.response.then_some(message.answer_count),
+                duration_us,
+                connection,
+            }),
+        )])
+    }
+
     fn process_message(
         &mut self,
         raw: KernelEvent,
@@ -217,11 +298,16 @@ impl EventProcessor {
     ) -> Vec<DamEvent> {
         let connection_key = (raw.tgid, raw.connection_key);
         if message.response_to == 0 {
-            let Some(command) = message.command else {
+            let Some(mut command) = message.command else {
                 return Vec::new();
             };
+            // Do not retain a clear authentication principal while waiting for
+            // the matching response. Hash it at the first userspace boundary.
+            let principal_hash =
+                take_hashed_principal(&mut command, self.config.principal_hash_salt.as_deref());
             let request = PendingRequest {
                 command,
+                principal_hash,
                 request_id: message.request_id,
                 request_bytes: message.wire_bytes,
                 compressed: message.compressed,
@@ -230,6 +316,7 @@ impl EventProcessor {
                 connection: self.connection_metadata(&raw),
             };
             if request.expects_response {
+                self.prune_pending_requests(raw.timestamp_ns);
                 self.pending.insert(
                     (connection_key.0, connection_key.1, request.request_id),
                     request,
@@ -303,12 +390,6 @@ impl EventProcessor {
             } else {
                 "unknown"
             };
-            let principal = request.command.principal.as_deref().and_then(|principal| {
-                self.config
-                    .principal_hash_salt
-                    .as_deref()
-                    .map(|salt| hash_principal(salt, principal))
-            });
             result.push(
                 self.event_from_seed(
                     request.seed,
@@ -317,7 +398,7 @@ impl EventProcessor {
                             .command
                             .auth_mechanism
                             .unwrap_or_else(|| default_mechanism.into()),
-                        principal,
+                        principal: request.principal_hash,
                         principal_hashed: true,
                         succeeded,
                         connection_id: request.connection.connection_id,
@@ -372,18 +453,35 @@ impl EventProcessor {
         let raw = captured.raw;
         let key = (raw.tgid, raw.connection_key);
         let state = self.connections.entry(key).or_default();
-        let (name, duration_us) = match raw.operation {
-            OP_TCP_CONNECT => ("connect_started", None),
-            OP_TCP_ACCEPT => ("accepted", None),
-            OP_TCP_CLOSE => ("closed", None),
+        let (name, duration_us, reason) = match raw.operation {
+            OP_TCP_CONNECT => ("connect_started", None, None),
+            OP_TCP_ACCEPT => ("accepted", None, None),
+            OP_TCP_CLOSE => ("closed", None, None),
             OP_TCP_RTT => {
                 state.tcp_srtt_us = Some((raw.duration_ns / 1_000).min(u32::MAX as u64) as u32);
-                ("rtt_sample", Some(raw.duration_ns / 1_000))
+                ("rtt_sample", Some(raw.duration_ns / 1_000), None)
             }
             OP_TCP_RETRANSMIT => {
                 state.retransmits = state.retransmits.saturating_add(1);
-                ("retransmit", None)
+                ("retransmit", None, None)
             }
+            OP_TCP_HANDSHAKE => (
+                "handshake_established",
+                (raw.duration_ns > 0).then_some(raw.duration_ns / 1_000),
+                None,
+            ),
+            OP_TCP_RESET_RECEIVED => ("reset", None, Some("peer_reset".into())),
+            OP_TCP_RESET_SENT => ("reset", None, Some("active_reset".into())),
+            OP_TCP_ZERO_WINDOW => (
+                "zero_window",
+                None,
+                Some("peer_advertised_zero_window".into()),
+            ),
+            OP_TCP_TIMEOUT => (
+                "timeout",
+                (raw.duration_ns > 0).then_some(raw.duration_ns / 1_000),
+                Some("connect_or_retransmission_timeout".into()),
+            ),
             _ => return Vec::new(),
         };
         let connection = self.connection_metadata(&raw);
@@ -393,6 +491,8 @@ impl EventProcessor {
                 .retain(|(tgid, connection_key, _), _| (*tgid, *connection_key) != key);
             self.pending
                 .retain(|(tgid, connection_key, _), _| (*tgid, *connection_key) != key);
+            self.pending_dns
+                .retain(|(tgid, connection_key, _), _| (*tgid, *connection_key) != key);
         }
         vec![self.event(
             &raw,
@@ -401,7 +501,7 @@ impl EventProcessor {
                 state: name.into(),
                 connection,
                 duration_us,
-                reason: None,
+                reason,
             }),
         )]
     }
@@ -445,6 +545,13 @@ impl EventProcessor {
             OP_PROCESS_EXIT => "exit",
             _ => return Vec::new(),
         };
+        if raw.operation == OP_PROCESS_EXIT {
+            self.streams.retain(|(tgid, _, _), _| *tgid != raw.tgid);
+            self.pending.retain(|(tgid, _, _), _| *tgid != raw.tgid);
+            self.pending_dns.retain(|(tgid, _, _), _| *tgid != raw.tgid);
+            self.connections.retain(|(tgid, _), _| *tgid != raw.tgid);
+            self.endpoint_cache.retain(|(tgid, _), _| *tgid != raw.tgid);
+        }
         let executable = process_executable(&self.config.host_proc, raw.tgid);
         vec![self.event(
             &raw,
@@ -528,6 +635,25 @@ impl EventProcessor {
         }
     }
 
+    fn prune_pending_requests(&mut self, now_ns: u64) {
+        if self.pending.len() < MAX_PENDING_REQUESTS {
+            return;
+        }
+        let cutoff = now_ns.saturating_sub(PENDING_REQUEST_TTL_NS);
+        self.pending
+            .retain(|_, request| request.seed.monotonic_timestamp_ns >= cutoff);
+        if self.pending.len() >= MAX_PENDING_REQUESTS {
+            if let Some(oldest) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, request)| request.seed.monotonic_timestamp_ns)
+                .map(|(key, _)| *key)
+            {
+                self.pending.remove(&oldest);
+            }
+        }
+    }
+
     fn connection_metadata(&mut self, raw: &KernelEvent) -> ConnectionMetadata {
         let state = self
             .connections
@@ -548,7 +674,11 @@ impl EventProcessor {
             remote: endpoints.map(|value| value.1),
             tcp_srtt_us,
             retransmits,
-            tls: Some(raw.source == 2),
+            tls: match raw.source {
+                2 => Some(true),
+                1 => Some(false),
+                _ => None,
+            },
         }
     }
 
@@ -573,6 +703,121 @@ impl EventProcessor {
             },
         );
         Some(endpoints)
+    }
+}
+
+struct DecodedDnsMessage {
+    query_id: u16,
+    response: bool,
+    response_code: u8,
+    answer_count: u16,
+    name: Option<String>,
+    record_type: Option<String>,
+}
+
+fn decode_dns_message(bytes: &[u8]) -> Result<DecodedDnsMessage, String> {
+    if bytes.len() < 12 {
+        return Err("truncated DNS header".into());
+    }
+    let query_id = read_network_u16(bytes, 0)?;
+    let flags = read_network_u16(bytes, 2)?;
+    let question_count = read_network_u16(bytes, 4)?;
+    let answer_count = read_network_u16(bytes, 6)?;
+    let (name, record_type) = if question_count > 0 {
+        let (name, after_name) = parse_dns_name(bytes, 12)?;
+        let record_type = read_network_u16(bytes, after_name)?;
+        let _record_class = read_network_u16(bytes, after_name + 2)?;
+        (Some(name), Some(dns_record_type(record_type)))
+    } else {
+        (None, None)
+    };
+    Ok(DecodedDnsMessage {
+        query_id,
+        response: flags & 0x8000 != 0,
+        response_code: (flags & 0x000f) as u8,
+        answer_count,
+        name,
+        record_type,
+    })
+}
+
+fn parse_dns_name(bytes: &[u8], offset: usize) -> Result<(String, usize), String> {
+    let mut labels = Vec::new();
+    let mut cursor = offset;
+    let mut after_name = None;
+    let mut jumps = 0usize;
+    let mut decoded_bytes = 0usize;
+    loop {
+        let length = *bytes
+            .get(cursor)
+            .ok_or_else(|| "truncated DNS name".to_string())?;
+        if length & 0xc0 == 0xc0 {
+            let second = *bytes
+                .get(cursor + 1)
+                .ok_or_else(|| "truncated DNS compression pointer".to_string())?;
+            after_name.get_or_insert(cursor + 2);
+            cursor = ((((length & 0x3f) as u16) << 8) | second as u16) as usize;
+            jumps += 1;
+            if jumps > 16 {
+                return Err("DNS compression pointer loop".into());
+            }
+            continue;
+        }
+        if length & 0xc0 != 0 {
+            return Err("invalid DNS label type".into());
+        }
+        cursor += 1;
+        if length == 0 {
+            let end = after_name.unwrap_or(cursor);
+            return Ok((labels.join(".").to_ascii_lowercase(), end));
+        }
+        if length > 63 {
+            return Err("invalid DNS label length".into());
+        }
+        let end = cursor
+            .checked_add(length as usize)
+            .ok_or_else(|| "invalid DNS label length".to_string())?;
+        let label = bytes
+            .get(cursor..end)
+            .ok_or_else(|| "truncated DNS label".to_string())?;
+        if !label
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err("DNS label contains unsupported bytes".into());
+        }
+        decoded_bytes = decoded_bytes.saturating_add(label.len() + 1);
+        if decoded_bytes > 254 {
+            return Err("DNS name exceeds protocol limit".into());
+        }
+        labels.push(String::from_utf8_lossy(label).into_owned());
+        cursor = end;
+    }
+}
+
+fn read_network_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| "truncated DNS integer".to_string())?
+        .try_into()
+        .map(u16::from_be_bytes)
+        .map_err(|_| "truncated DNS integer".to_string())
+}
+
+fn dns_record_type(value: u16) -> String {
+    match value {
+        1 => "A".into(),
+        2 => "NS".into(),
+        5 => "CNAME".into(),
+        6 => "SOA".into(),
+        12 => "PTR".into(),
+        15 => "MX".into(),
+        16 => "TXT".into(),
+        28 => "AAAA".into(),
+        33 => "SRV".into(),
+        41 => "OPT".into(),
+        255 => "ANY".into(),
+        other => other.to_string(),
     }
 }
 
@@ -612,6 +857,13 @@ fn hash_principal(salt: &str, principal: &str) -> String {
     digest.update([0]);
     digest.update(principal.as_bytes());
     format!("sha256:{}", hex::encode(digest.finalize()))
+}
+
+fn take_hashed_principal(command: &mut MongoCommand, salt: Option<&str>) -> Option<String> {
+    command
+        .principal
+        .take()
+        .and_then(|principal| salt.map(|salt| hash_principal(salt, &principal)))
 }
 
 fn process_executable(host_proc: &Path, tgid: u32) -> Option<String> {
@@ -700,7 +952,12 @@ fn resolve_socket_endpoints(
     .ok()?;
     let link = link.to_string_lossy();
     let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
-    for (name, ipv6) in [("tcp", false), ("tcp6", true)] {
+    for (name, ipv6) in [
+        ("tcp", false),
+        ("tcp6", true),
+        ("udp", false),
+        ("udp6", true),
+    ] {
         let table =
             fs::read_to_string(host_proc.join(tgid.to_string()).join("net").join(name)).ok()?;
         if let Some(value) = parse_proc_net_tcp(&table, inode, ipv6) {
@@ -787,8 +1044,40 @@ mod tests {
     #[test]
     fn user_management_principals_are_treated_as_auth_and_hashed() {
         assert!(is_auth_command("createUser"));
-        let hashed = hash_principal("customer-salt", "alice@example.com");
+        let mut command = MongoCommand {
+            name: "createUser".into(),
+            database: Some("admin".into()),
+            collection: None,
+            auth_mechanism: None,
+            principal: Some("alice@example.com".into()),
+        };
+        let hashed = take_hashed_principal(&mut command, Some("customer-salt")).unwrap();
         assert!(hashed.starts_with("sha256:"));
         assert!(!hashed.contains("alice"));
+        assert!(command.principal.is_none());
+    }
+
+    #[test]
+    fn decodes_dns_srv_query_and_response_metadata() {
+        let mut query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in ["_mongodb", "_tcp", "example", "com"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 33, 0, 1]);
+
+        let decoded = decode_dns_message(&query).unwrap();
+        assert_eq!(decoded.query_id, 0x1234);
+        assert!(!decoded.response);
+        assert_eq!(decoded.name.as_deref(), Some("_mongodb._tcp.example.com"));
+        assert_eq!(decoded.record_type.as_deref(), Some("SRV"));
+
+        query[2] = 0x81;
+        query[3] = 0x83;
+        let decoded = decode_dns_message(&query).unwrap();
+        assert!(decoded.response);
+        assert_eq!(decoded.response_code, 3);
     }
 }

@@ -13,7 +13,7 @@ secrets:
   existingSecret: mongodb-dam-secrets
   create: false
   observerInternalToken: ""
-  collectToken: ""
+  bearerToken: ""
   principalHashSalt: ""
   mongodbRootUsername: ""
   mongodbRootPassword: ""
@@ -28,13 +28,11 @@ images:
     tag: dev
     pullPolicy: IfNotPresent
 
-collect:
-  # Replace this with the HTTPS HTTP-push endpoint in the regional cell.
-  url: https://collect.invalid/v1/ingest/mongodb-dam
-  tokenHeader: x-rover-collect-token
-  idempotencyHeader: idempotency-key
+destination:
+  # Opaque HTTPS ingress endpoint in the regional cell. It need not be Collect.
+  endpoint: https://regional-ingress.invalid/v1/ingest/mongodb-dam
   caSecretName: ""
-  caSecretKey: collect-ca.pem
+  caSecretKey: destination-ca.pem
 
 mongodb:
   enabled: true
@@ -61,6 +59,7 @@ mongodb:
   affinity: {}
 
 observer:
+  mongodbPort: 27017
   cpuProfileHz: 49
   tlsUprobes: auto
   lockProfiling: true

@@ -23,24 +23,12 @@ struct Cli {
     cluster_name: String,
     #[arg(long, env = "OUTPOST_INTERNAL_TOKEN_FILE")]
     internal_token_file: Option<PathBuf>,
-    #[arg(long, env = "OUTPOST_COLLECT_URL")]
-    collect_url: String,
-    #[arg(long, env = "OUTPOST_COLLECT_TOKEN_FILE")]
-    collect_token_file: PathBuf,
-    #[arg(long, env = "OUTPOST_COLLECT_CA_FILE")]
-    collect_ca_file: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "OUTPOST_COLLECT_TOKEN_HEADER",
-        default_value = "x-rover-collect-token"
-    )]
-    collect_token_header: String,
-    #[arg(
-        long,
-        env = "OUTPOST_IDEMPOTENCY_HEADER",
-        default_value = "idempotency-key"
-    )]
-    idempotency_header: String,
+    #[arg(long, env = "OUTPOST_ENDPOINT")]
+    endpoint: String,
+    #[arg(long, env = "OUTPOST_BEARER_TOKEN_FILE")]
+    bearer_token_file: PathBuf,
+    #[arg(long, env = "OUTPOST_CA_FILE")]
+    ca_file: Option<PathBuf>,
     #[arg(
         long,
         env = "OUTPOST_SPOOL_DIR",
@@ -80,7 +68,7 @@ async fn main() -> Result<()> {
         .json()
         .init();
     let cli = Cli::parse();
-    let collect_token = read_secret(&cli.collect_token_file)?;
+    let bearer_token = read_secret(&cli.bearer_token_file)?;
     let internal_token = cli
         .internal_token_file
         .as_deref()
@@ -96,11 +84,9 @@ async fn main() -> Result<()> {
         regional_cell_id: cli.regional_cell_id,
         cluster_name: cli.cluster_name,
         internal_token,
-        collect_url: cli.collect_url,
-        collect_token,
-        collect_ca_file: cli.collect_ca_file,
-        collect_token_header: cli.collect_token_header,
-        idempotency_header: cli.idempotency_header,
+        endpoint: cli.endpoint,
+        bearer_token,
+        ca_file: cli.ca_file,
         spool_dir: cli.spool_dir,
         spool_max_bytes: cli.spool_max_bytes,
         max_request_bytes: cli.max_request_bytes,

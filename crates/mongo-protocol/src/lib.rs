@@ -3,6 +3,8 @@ use snap::raw::Decoder as SnappyDecoder;
 use std::io::Read;
 use thiserror::Error;
 
+pub const OP_REPLY: i32 = 1;
+pub const OP_QUERY: i32 = 2004;
 pub const OP_COMPRESSED: i32 = 2012;
 pub const OP_MSG: i32 = 2013;
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
@@ -127,6 +129,53 @@ impl StreamDecoder {
         Ok(decoded)
     }
 
+    /// Decodes a large uncompressed frame from only its first `prefix_limit`
+    /// bytes. This bounds retained stream data even when an application emits
+    /// one frame through many individually short syscalls.
+    pub fn push_bounded_prefix(
+        &mut self,
+        bytes: &[u8],
+        prefix_limit: usize,
+    ) -> Result<Vec<DecodedMessage>, DecodeError> {
+        if prefix_limit < 16 || prefix_limit > self.config.max_buffer_bytes {
+            self.buffer.clear();
+            return Err(DecodeError::BufferTooLarge);
+        }
+
+        let Some(frame_length) = self.next_frame_length(bytes)? else {
+            return self.push(bytes);
+        };
+        if frame_length <= prefix_limit
+            || self.buffer.len().saturating_add(bytes.len()) < prefix_limit
+        {
+            return self.push(bytes);
+        }
+
+        let needed = prefix_limit.saturating_sub(self.buffer.len());
+        let message = self.push_truncated(&bytes[..needed.min(bytes.len())])?;
+        Ok(vec![message])
+    }
+
+    fn next_frame_length(&self, bytes: &[u8]) -> Result<Option<usize>, DecodeError> {
+        let mut header = [0u8; 4];
+        let buffered = self.buffer.len().min(4);
+        header[..buffered].copy_from_slice(&self.buffer[..buffered]);
+        let needed = 4 - buffered;
+        if bytes.len() < needed {
+            return Ok(None);
+        }
+        header[buffered..].copy_from_slice(&bytes[..needed]);
+        let length = i32::from_le_bytes(header);
+        if length < 16 {
+            return Err(DecodeError::InvalidFrameLength(length));
+        }
+        let length = length as usize;
+        if length > self.config.max_message_bytes {
+            return Err(DecodeError::FrameTooLarge);
+        }
+        Ok(Some(length))
+    }
+
     /// Finishes a stream prefix when the sensor copied only the beginning of
     /// the current syscall buffer. Bytes accumulated from earlier short reads
     /// are included, then the stream is reset because the omitted tail cannot
@@ -161,6 +210,8 @@ pub fn decode_frame(frame: &[u8], max_message_bytes: usize) -> Result<DecodedMes
 
     match opcode {
         OP_MSG => decode_op_msg(request_id, response_to, frame.len(), payload, false),
+        OP_QUERY => decode_op_query(request_id, response_to, frame.len(), payload, false),
+        OP_REPLY => decode_op_reply(request_id, response_to, frame.len(), payload, false),
         OP_COMPRESSED => decode_compressed(
             request_id,
             response_to,
@@ -202,17 +253,28 @@ pub fn decode_frame_prefix(
     if opcode == OP_COMPRESSED {
         return Err(DecodeError::Truncated);
     }
-    if opcode != OP_MSG {
-        return Err(DecodeError::UnsupportedOpcode(opcode));
+    match opcode {
+        OP_MSG => decode_op_msg_prefix(request_id, response_to, declared, &prefix[16..]),
+        OP_QUERY => decode_op_query_prefix(request_id, response_to, declared, &prefix[16..]),
+        OP_REPLY => decode_op_reply_prefix(request_id, response_to, declared, &prefix[16..]),
+        other => Err(DecodeError::UnsupportedOpcode(other)),
     }
-    if prefix.len() < 22 {
+}
+
+fn decode_op_msg_prefix(
+    request_id: i32,
+    response_to: i32,
+    declared: usize,
+    payload: &[u8],
+) -> Result<DecodedMessage, DecodeError> {
+    if payload.len() < 6 {
         return Err(DecodeError::Truncated);
     }
-    let flags = read_u32(prefix, 16)?;
-    if prefix[20] != 0 {
-        return Err(DecodeError::UnsupportedSection(prefix[20]));
+    let flags = read_u32(payload, 0)?;
+    if payload[4] != 0 {
+        return Err(DecodeError::UnsupportedSection(payload[4]));
     }
-    let document = &prefix[21..];
+    let document = &payload[5..];
     let summary = summarize_bson_prefix(document)?;
     let command = if response_to == 0 {
         command_from_summary(&summary)
@@ -295,7 +357,223 @@ fn decode_compressed(
     }
     match original_opcode {
         OP_MSG => decode_op_msg(request_id, response_to, wire_bytes, &uncompressed, true),
+        OP_QUERY => decode_op_query(request_id, response_to, wire_bytes, &uncompressed, true),
+        OP_REPLY => decode_op_reply(request_id, response_to, wire_bytes, &uncompressed, true),
         other => Err(DecodeError::UnsupportedOpcode(other)),
+    }
+}
+
+fn decode_op_query(
+    request_id: i32,
+    response_to: i32,
+    wire_bytes: usize,
+    payload: &[u8],
+    compressed: bool,
+) -> Result<DecodedMessage, DecodeError> {
+    if payload.len() < 13 {
+        return Err(DecodeError::Truncated);
+    }
+    let flags = read_u32(payload, 0)?;
+    let (namespace, after_namespace) = read_cstring(payload, 4)?;
+    let document_offset = after_namespace
+        .checked_add(8)
+        .ok_or(DecodeError::InvalidBson)?;
+    let document_length = read_i32(payload, document_offset)?;
+    if document_length < 5 {
+        return Err(DecodeError::InvalidBson);
+    }
+    let document_end = document_offset
+        .checked_add(document_length as usize)
+        .ok_or(DecodeError::InvalidBson)?;
+    if document_end > payload.len() {
+        return Err(DecodeError::InvalidBson);
+    }
+    let summary = summarize_bson(&payload[document_offset..document_end])?;
+    Ok(decoded_op_query(
+        request_id,
+        response_to,
+        wire_bytes,
+        flags,
+        namespace,
+        summary,
+        compressed,
+    ))
+}
+
+fn decode_op_query_prefix(
+    request_id: i32,
+    response_to: i32,
+    wire_bytes: usize,
+    payload: &[u8],
+) -> Result<DecodedMessage, DecodeError> {
+    if payload.len() < 13 {
+        return Err(DecodeError::Truncated);
+    }
+    let flags = read_u32(payload, 0)?;
+    let (namespace, after_namespace) = read_cstring(payload, 4)?;
+    let document_offset = after_namespace
+        .checked_add(8)
+        .ok_or(DecodeError::InvalidBson)?;
+    let summary = summarize_bson_prefix(
+        payload
+            .get(document_offset..)
+            .ok_or(DecodeError::Truncated)?,
+    )?;
+    Ok(decoded_op_query(
+        request_id,
+        response_to,
+        wire_bytes,
+        flags,
+        namespace,
+        summary,
+        false,
+    ))
+}
+
+fn decoded_op_query(
+    request_id: i32,
+    response_to: i32,
+    wire_bytes: usize,
+    flags: u32,
+    namespace: &str,
+    summary: BsonSummary,
+    compressed: bool,
+) -> DecodedMessage {
+    let (database, namespace_collection, is_command) = split_legacy_namespace(namespace);
+    let command = if response_to != 0 {
+        None
+    } else if is_command {
+        command_from_summary(&summary).map(|mut command| {
+            if command.database.is_none() {
+                command.database = database;
+            }
+            command
+        })
+    } else {
+        Some(MongoCommand {
+            name: "find".into(),
+            database,
+            collection: namespace_collection,
+            auth_mechanism: None,
+            principal: None,
+        })
+    };
+    DecodedMessage {
+        request_id,
+        response_to,
+        wire_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
+        flags,
+        more_to_come: false,
+        compressed,
+        command,
+        status: None,
+    }
+}
+
+fn decode_op_reply(
+    request_id: i32,
+    response_to: i32,
+    wire_bytes: usize,
+    payload: &[u8],
+    compressed: bool,
+) -> Result<DecodedMessage, DecodeError> {
+    if payload.len() < 20 {
+        return Err(DecodeError::Truncated);
+    }
+    let flags = read_u32(payload, 0)?;
+    let returned = read_i32(payload, 16)?;
+    let summary = if returned > 0 && payload.len() > 20 {
+        let document_length = read_i32(payload, 20)?;
+        if document_length < 5 {
+            return Err(DecodeError::InvalidBson);
+        }
+        let document_end = 20usize
+            .checked_add(document_length as usize)
+            .ok_or(DecodeError::InvalidBson)?;
+        if document_end > payload.len() {
+            return Err(DecodeError::InvalidBson);
+        }
+        Some(summarize_bson(&payload[20..document_end])?)
+    } else {
+        None
+    };
+    Ok(decoded_op_reply(
+        request_id,
+        response_to,
+        wire_bytes,
+        flags,
+        summary,
+        compressed,
+    ))
+}
+
+fn decode_op_reply_prefix(
+    request_id: i32,
+    response_to: i32,
+    wire_bytes: usize,
+    payload: &[u8],
+) -> Result<DecodedMessage, DecodeError> {
+    if payload.len() < 20 {
+        return Err(DecodeError::Truncated);
+    }
+    let flags = read_u32(payload, 0)?;
+    let returned = read_i32(payload, 16)?;
+    let summary = if returned > 0 && payload.len() > 20 {
+        Some(summarize_bson_prefix(&payload[20..])?)
+    } else {
+        None
+    };
+    Ok(decoded_op_reply(
+        request_id,
+        response_to,
+        wire_bytes,
+        flags,
+        summary,
+        false,
+    ))
+}
+
+fn decoded_op_reply(
+    request_id: i32,
+    response_to: i32,
+    wire_bytes: usize,
+    flags: u32,
+    summary: Option<BsonSummary>,
+    compressed: bool,
+) -> DecodedMessage {
+    let failed = flags & 0x03 != 0;
+    let status = Some(ResponseStatus {
+        ok: summary
+            .as_ref()
+            .and_then(|value| value.ok)
+            .or(Some(!failed)),
+        code: summary.as_ref().and_then(|value| value.code),
+        code_name: summary.and_then(|value| value.code_name),
+    });
+    DecodedMessage {
+        request_id,
+        response_to,
+        wire_bytes: u32::try_from(wire_bytes).unwrap_or(u32::MAX),
+        flags,
+        more_to_come: false,
+        compressed,
+        command: None,
+        status,
+    }
+}
+
+fn split_legacy_namespace(namespace: &str) -> (Option<String>, Option<String>, bool) {
+    let Some((database, collection)) = namespace.split_once('.') else {
+        return (None, None, false);
+    };
+    if collection == "$cmd" || collection.starts_with("$cmd.") {
+        (Some(database.to_string()), None, true)
+    } else {
+        (
+            Some(database.to_string()),
+            Some(collection.to_string()),
+            false,
+        )
     }
 }
 
@@ -512,6 +790,12 @@ fn summarize_bson(document: &[u8]) -> Result<BsonSummary, DecodeError> {
             "user" if element_type == 0x02 => {
                 summary.principal = read_bson_string(document, value_start).ok();
             }
+            "payload" if element_type == 0x05 => {
+                summary.principal = read_bson_binary(document, value_start)
+                    .ok()
+                    .and_then(parse_scram_principal)
+                    .or(summary.principal);
+            }
             _ => {}
         }
         ordinal += 1;
@@ -567,6 +851,12 @@ fn summarize_bson_prefix(document: &[u8]) -> Result<BsonSummary, DecodeError> {
             }
             "user" if element_type == 0x02 => {
                 summary.principal = read_bson_string(document, value_start).ok();
+            }
+            "payload" if element_type == 0x05 => {
+                summary.principal = read_bson_binary(document, value_start)
+                    .ok()
+                    .and_then(parse_scram_principal)
+                    .or(summary.principal);
             }
             _ => {}
         }
@@ -670,6 +960,31 @@ fn read_bson_string(bytes: &[u8], offset: usize) -> Result<String, DecodeError> 
         .map_err(|_| DecodeError::InvalidBson)
 }
 
+fn read_bson_binary(bytes: &[u8], offset: usize) -> Result<&[u8], DecodeError> {
+    let length = read_i32(bytes, offset)?;
+    if length < 0 {
+        return Err(DecodeError::InvalidBson);
+    }
+    let start = offset.checked_add(5).ok_or(DecodeError::InvalidBson)?;
+    let end = start
+        .checked_add(length as usize)
+        .ok_or(DecodeError::InvalidBson)?;
+    bytes.get(start..end).ok_or(DecodeError::InvalidBson)
+}
+
+fn parse_scram_principal(payload: &[u8]) -> Option<String> {
+    let payload = std::str::from_utf8(payload).ok()?;
+    let encoded = payload
+        .split(',')
+        .find_map(|field| field.strip_prefix("n=").filter(|value| !value.is_empty()))?;
+    if encoded.len() > 768 {
+        return None;
+    }
+    let decoded = encoded.replace("=2C", ",").replace("=3D", "=");
+    (!decoded.is_empty() && decoded.len() <= 256 && !decoded.chars().any(char::is_control))
+        .then_some(decoded)
+}
+
 fn read_boolish(bytes: &[u8], offset: usize, element_type: u8) -> Option<bool> {
     match element_type {
         0x01 => {
@@ -764,6 +1079,16 @@ mod tests {
         bytes
     }
 
+    fn binary_element(key: &str, value: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x05];
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&(value.len() as i32).to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(value);
+        bytes
+    }
+
     fn document(elements: Vec<Vec<u8>>) -> Vec<u8> {
         let mut bytes = vec![0, 0, 0, 0];
         for element in elements {
@@ -783,6 +1108,35 @@ mod tests {
         frame.extend_from_slice(&request_id.to_le_bytes());
         frame.extend_from_slice(&response_to.to_le_bytes());
         frame.extend_from_slice(&OP_MSG.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    fn op_query(request_id: i32, namespace: &str, bson: Vec<u8>) -> Vec<u8> {
+        let mut payload = 0u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(namespace.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&(-1i32).to_le_bytes());
+        payload.extend_from_slice(&bson);
+        let mut frame = ((16 + payload.len()) as i32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&request_id.to_le_bytes());
+        frame.extend_from_slice(&0i32.to_le_bytes());
+        frame.extend_from_slice(&OP_QUERY.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    fn op_reply(request_id: i32, response_to: i32, flags: u32, bson: Vec<u8>) -> Vec<u8> {
+        let mut payload = flags.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0i64.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&1i32.to_le_bytes());
+        payload.extend_from_slice(&bson);
+        let mut frame = ((16 + payload.len()) as i32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&request_id.to_le_bytes());
+        frame.extend_from_slice(&response_to.to_le_bytes());
+        frame.extend_from_slice(&OP_REPLY.to_le_bytes());
         frame.extend_from_slice(&payload);
         frame
     }
@@ -827,6 +1181,66 @@ mod tests {
         assert_eq!(command.database.as_deref(), Some("admin"));
         assert_eq!(command.collection, None);
         assert_eq!(command.principal.as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn extracts_scram_principal_without_retaining_the_auth_payload() {
+        let bson = document(vec![
+            int_element("saslStart", 1),
+            string_element("mechanism", "SCRAM-SHA-256"),
+            binary_element("payload", b"n,,n=alice=2Cops,r=client-nonce"),
+            string_element("$db", "admin"),
+        ]);
+        let frame = op_msg(45, 0, 0, bson);
+        let command = decode_frame(&frame, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .command
+            .unwrap();
+
+        assert_eq!(command.name, "saslStart");
+        assert_eq!(command.auth_mechanism.as_deref(), Some("SCRAM-SHA-256"));
+        assert_eq!(command.principal.as_deref(), Some("alice,ops"));
+    }
+
+    #[test]
+    fn decodes_legacy_op_query_and_reply_metadata() {
+        let query = op_query(
+            51,
+            "sales.$cmd",
+            document(vec![
+                string_element("find", "orders"),
+                string_element("$db", "sales"),
+            ]),
+        );
+        let command = decode_frame(&query, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .command
+            .unwrap();
+        assert_eq!(command.name, "find");
+        assert_eq!(command.database.as_deref(), Some("sales"));
+        assert_eq!(command.collection.as_deref(), Some("orders"));
+
+        let reply = op_reply(52, 51, 0, document(vec![double_element("ok", 1.0)]));
+        let response = decode_frame(&reply, DEFAULT_MAX_MESSAGE_BYTES).unwrap();
+        assert_eq!(response.response_to, 51);
+        assert_eq!(response.status.unwrap().ok, Some(true));
+    }
+
+    #[test]
+    fn maps_legacy_collection_queries_to_find_without_filter_values() {
+        let query = op_query(
+            53,
+            "sales.orders",
+            document(vec![string_element("secret", "must-not-be-exported")]),
+        );
+        let command = decode_frame(&query, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .command
+            .unwrap();
+        assert_eq!(command.name, "find");
+        assert_eq!(command.database.as_deref(), Some("sales"));
+        assert_eq!(command.collection.as_deref(), Some("orders"));
+        assert_eq!(command.principal, None);
     }
 
     #[test]
@@ -877,6 +1291,36 @@ mod tests {
         assert_eq!(message.request_id, 42);
         assert_eq!(message.wire_bytes as usize, frame.len());
         assert_eq!(message.command.unwrap().name, "find");
+        assert_eq!(decoder.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn bounds_a_large_frame_split_across_short_reads_to_its_prefix() {
+        let bson = document(vec![
+            string_element("find", "orders"),
+            string_element("$db", "sales"),
+            string_element("filter", &"private-value".repeat(256)),
+        ]);
+        let frame = op_msg(91, 0, 0, bson);
+        let mut decoder = StreamDecoder::new(DecoderConfig {
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            max_buffer_bytes: 2_048,
+        });
+
+        assert!(decoder
+            .push_bounded_prefix(&frame[..512], 1_024)
+            .unwrap()
+            .is_empty());
+        let messages = decoder
+            .push_bounded_prefix(&frame[512..1_024], 1_024)
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].command.as_ref().unwrap().name, "find");
+        assert_eq!(
+            messages[0].command.as_ref().unwrap().database.as_deref(),
+            Some("sales")
+        );
         assert_eq!(decoder.buffered_bytes(), 0);
     }
 

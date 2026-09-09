@@ -11,8 +11,8 @@ done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run_id="$$"
 network="mongodb-dam-contract-$run_id"
-mock="mongodb-dam-mock-$run_id"
-reject_mock="mongodb-dam-mock-reject-$run_id"
+mock="mongodb-dam-endpoint-$run_id"
+reject_mock="mongodb-dam-endpoint-reject-$run_id"
 outpost="mongodb-dam-outpost-$run_id"
 
 cleanup() {
@@ -23,23 +23,23 @@ trap cleanup EXIT
 
 docker build --file "$repo_root/Dockerfile.outpost" --target outpost \
   --tag mongodb-dam-outpost:dev "$repo_root" >/dev/null
-docker build --file "$repo_root/Dockerfile.outpost" --target mock-collect \
-  --tag mongodb-dam-mock-collect:dev "$repo_root" >/dev/null
+docker build --file "$repo_root/Dockerfile.outpost" --target mock-endpoint \
+  --tag mongodb-dam-mock-endpoint:dev "$repo_root" >/dev/null
 
 docker network create "$network" >/dev/null
 docker run --detach --rm \
   --name "$mock" \
   --network "$network" \
-  --network-alias mock-collect \
-  -e MOCK_COLLECT_TOKEN=integration-collect-token \
-  mongodb-dam-mock-collect:dev >/dev/null
+  --network-alias mock-endpoint \
+  -e MOCK_ENDPOINT_BEARER_TOKEN=integration-bearer-token \
+  mongodb-dam-mock-endpoint:dev >/dev/null
 
 docker run --detach --rm \
   --name "$outpost" \
   --network "$network" \
   --publish 127.0.0.1::8090 \
   --tmpfs /var/lib/mongodb-dam/outpost:rw,uid=65532,gid=65532,size=67108864 \
-  --mount "type=bind,src=$repo_root/tests/fixtures/collect-token.txt,dst=/run/secrets/collect-token,readonly" \
+  --mount "type=bind,src=$repo_root/tests/fixtures/bearer-token.txt,dst=/run/secrets/bearer-token,readonly" \
   --mount "type=bind,src=$repo_root/tests/fixtures/internal-token.txt,dst=/run/secrets/internal-token,readonly" \
   -e DAM_CUSTOMER_ID=integration-customer \
   -e DAM_TENANT_ID=integration-tenant \
@@ -47,8 +47,8 @@ docker run --detach --rm \
   -e DAM_REGIONAL_CELL_ID=integration-cell \
   -e DAM_CLUSTER_NAME=integration-cluster \
   -e OUTPOST_INTERNAL_TOKEN_FILE=/run/secrets/internal-token \
-  -e OUTPOST_COLLECT_URL=http://mock-collect:8088/v1/ingest/mongodb-dam \
-  -e OUTPOST_COLLECT_TOKEN_FILE=/run/secrets/collect-token \
+  -e OUTPOST_ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam \
+  -e OUTPOST_BEARER_TOKEN_FILE=/run/secrets/bearer-token \
   -e OUTPOST_EXPORT_INTERVAL_SECONDS=1 \
   mongodb-dam-outpost:dev >/dev/null
 
@@ -86,9 +86,9 @@ docker stop "$mock" >/dev/null
 docker run --detach --rm \
   --name "$reject_mock" \
   --network "$network" \
-  --network-alias mock-collect \
-  -e MOCK_COLLECT_TOKEN=reject-this-outpost-token \
-  mongodb-dam-mock-collect:dev >/dev/null
+  --network-alias mock-endpoint \
+  -e MOCK_ENDPOINT_BEARER_TOKEN=reject-this-outpost-token \
+  mongodb-dam-mock-endpoint:dev >/dev/null
 
 curl --fail --silent \
   --request POST \

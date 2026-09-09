@@ -106,6 +106,8 @@ struct Cli {
     max_message_bytes: usize,
     #[arg(long, env = "OBSERVER_CPU_PROFILE_HZ", default_value_t = 49)]
     cpu_profile_hz: u32,
+    #[arg(long, env = "OBSERVER_MONGODB_PORT", default_value_t = 27017)]
+    mongodb_port: u16,
     #[arg(long, env = "OBSERVER_TLS_UPROBES", value_enum, default_value = "auto")]
     tls_uprobes: TlsUprobeMode,
     #[arg(long, env = "OBSERVER_LOCK_PROFILING", default_value_t = true)]
@@ -269,6 +271,7 @@ async fn main() -> Result<()> {
         host_proc: cli.host_proc.clone(),
         rescan_interval: Duration::from_secs(cli.rescan_seconds.max(1)),
         cpu_profile_hz: cli.cpu_profile_hz,
+        mongodb_port: cli.mongodb_port,
         tls_mode: cli.tls_uprobes,
         lock_profiling: cli.lock_profiling,
     };
@@ -358,6 +361,7 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         cli.cpu_profile_hz <= 999,
         "cpu_profile_hz must be at most 999"
     );
+    anyhow::ensure!(cli.mongodb_port > 0, "mongodb_port must be positive");
     Ok(())
 }
 
@@ -366,6 +370,7 @@ struct BpfConfig {
     host_proc: PathBuf,
     rescan_interval: Duration,
     cpu_profile_hz: u32,
+    mongodb_port: u16,
     tls_mode: TlsUprobeMode,
     lock_profiling: bool,
 }
@@ -379,9 +384,14 @@ fn run_bpf(
 ) -> Result<()> {
     raise_memlock_limit();
     let mut object = MaybeUninit::uninit();
-    let open = ObserverSkelBuilder::default()
+    let mut open = ObserverSkelBuilder::default()
         .open(&mut object)
         .context("opening the eBPF object")?;
+    open.maps
+        .rodata_data
+        .as_deref_mut()
+        .context("eBPF rodata map is unavailable")?
+        .mongodb_port = config.mongodb_port;
     let skel = open.load().context(
         "loading eBPF programs; the node needs BTF, Linux 5.8+, and privileged BPF access",
     )?;
@@ -411,11 +421,18 @@ fn run_bpf(
     required!(skel.progs.handle_process_exit, "sched/sched_process_exit");
     required!(skel.progs.handle_tcp_sendmsg, "tcp_sendmsg");
     required!(skel.progs.handle_tcp_recvmsg, "tcp_recvmsg");
+    optional!(skel.progs.handle_udp_sendmsg, "udp_sendmsg");
+    optional!(skel.progs.handle_udp_recvmsg, "udp_recvmsg");
+    optional!(skel.progs.handle_udpv6_sendmsg, "udpv6_sendmsg");
+    optional!(skel.progs.handle_udpv6_recvmsg, "udpv6_recvmsg");
     optional!(skel.progs.handle_tcp_connect, "tcp_connect");
+    optional!(skel.progs.handle_tcp_state, "tcp_set_state");
     optional!(skel.progs.handle_tcp_accept, "inet_csk_accept");
     optional!(skel.progs.handle_tcp_close, "tcp_close");
     optional!(skel.progs.handle_tcp_rtt, "tcp_rcv_established");
     optional!(skel.progs.handle_tcp_retransmit, "tcp_retransmit_skb");
+    optional!(skel.progs.handle_tcp_reset, "tcp_reset");
+    optional!(skel.progs.handle_tcp_active_reset, "tcp_send_active_reset");
     optional!(skel.progs.handle_page_fault_enter, "handle_mm_fault entry");
     optional!(skel.progs.handle_page_fault_exit, "handle_mm_fault return");
 
@@ -565,23 +582,47 @@ fn attach_ssl_uprobes(
     host_proc: &Path,
     progs: &bpf::ObserverProgs<'_>,
 ) -> Result<Vec<Link>> {
-    let candidates = mapped_libraries(host_proc, pid, &["libssl.so"])?;
+    let mut candidates = mapped_libraries(host_proc, pid, &["libssl.so", "libboringssl"])?;
+    let executable = host_proc.join(pid.to_string()).join("exe");
+    if candidates.is_empty() && executable.exists() {
+        candidates.push(executable);
+        candidates.sort();
+        candidates.dedup();
+    }
     let mut links = Vec::new();
     for path in candidates {
         let mut candidate_links = Vec::new();
-        for (program, symbol, retprobe) in [
-            (&progs.handle_ssl_read_enter, "SSL_read", false),
-            (&progs.handle_ssl_read_exit, "SSL_read", true),
-            (&progs.handle_ssl_write_enter, "SSL_write", false),
-            (&progs.handle_ssl_write_exit, "SSL_write", true),
+        for (entry, exit, symbol) in [
+            (
+                &progs.handle_ssl_read_enter,
+                &progs.handle_ssl_read_exit,
+                "SSL_read",
+            ),
+            (
+                &progs.handle_ssl_write_enter,
+                &progs.handle_ssl_write_exit,
+                "SSL_write",
+            ),
+            (
+                &progs.handle_ssl_read_ex_enter,
+                &progs.handle_ssl_read_ex_exit,
+                "SSL_read_ex",
+            ),
+            (
+                &progs.handle_ssl_write_ex_enter,
+                &progs.handle_ssl_write_ex_exit,
+                "SSL_write_ex",
+            ),
         ] {
-            candidate_links.push(attach_symbol(program, pid, &path, symbol, retprobe)?);
+            if let (Ok(entry), Ok(exit)) = (
+                attach_symbol(entry, pid, &path, symbol, false),
+                attach_symbol(exit, pid, &path, symbol, true),
+            ) {
+                candidate_links.push(entry);
+                candidate_links.push(exit);
+            }
         }
         for (program, symbol, retprobe) in [
-            (&progs.handle_ssl_read_ex_enter, "SSL_read_ex", false),
-            (&progs.handle_ssl_read_ex_exit, "SSL_read_ex", true),
-            (&progs.handle_ssl_write_ex_enter, "SSL_write_ex", false),
-            (&progs.handle_ssl_write_ex_exit, "SSL_write_ex", true),
             (&progs.handle_ssl_set_fd, "SSL_set_fd", false),
             (&progs.handle_ssl_free, "SSL_free", false),
         ] {
@@ -704,10 +745,12 @@ fn attach_cpu_sampling(
         }
     };
     for cpu in 0..cpus {
-        let mut attr = libbpf_sys::perf_event_attr::default();
-        attr.type_ = libbpf_sys::PERF_TYPE_SOFTWARE;
-        attr.size = size_of::<libbpf_sys::perf_event_attr>() as u32;
-        attr.config = libbpf_sys::PERF_COUNT_SW_CPU_CLOCK as u64;
+        let mut attr = libbpf_sys::perf_event_attr {
+            type_: libbpf_sys::PERF_TYPE_SOFTWARE,
+            size: size_of::<libbpf_sys::perf_event_attr>() as u32,
+            config: libbpf_sys::PERF_COUNT_SW_CPU_CLOCK as u64,
+            ..Default::default()
+        };
         attr.__bindgen_anon_1.sample_freq = frequency_hz as u64;
         attr.set_freq(1);
         attr.set_exclude_hv(1);

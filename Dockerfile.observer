@@ -3,7 +3,7 @@ FROM rust:1.88-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends clang libelf-dev make pkg-config zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup component add rustfmt
+    && rustup component add rustfmt clippy
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -17,7 +17,8 @@ RUN --mount=type=cache,id=mongodb-dam-cargo-registry,target=/usr/local/cargo/reg
 FROM builder AS test
 RUN --mount=type=cache,id=mongodb-dam-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=mongodb-dam-observer-test-target,target=/src/target \
-    cargo test --workspace --locked
+    cargo test --workspace --locked \
+    && cargo clippy --workspace --all-targets --locked -- -D warnings
 
 FROM debian:bookworm-slim
 RUN apt-get update \

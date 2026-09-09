@@ -15,8 +15,8 @@ images:
     tag: v0.1.0
     pullPolicy: IfNotPresent
 
-collect:
-  url: https://collect.cell-ap-south-1.example.com/v1/ingest/mongodb-dam
+destination:
+  endpoint: https://ingress.cell-ap-south-1.example.com/v1/ingest/mongodb-dam
   # For a private CA, create the named Secret in the customer cluster.
   caSecretName: ""
 

@@ -6,6 +6,12 @@
 #define TASK_COMM_LEN 16
 #define MAX_CAPTURE_BYTES 1024
 #define MAX_VECTOR_CHUNKS 2
+#define TCP_ESTABLISHED_STATE 1
+#define TCP_SYN_SENT_STATE 2
+#define TCP_SYN_RECV_STATE 3
+#define TCP_CLOSE_STATE 7
+#define ECONNRESET_CODE 104
+#define ETIMEDOUT_CODE 110
 
 #if defined(__TARGET_ARCH_x86)
 #define SYS_READ 0
@@ -45,6 +51,7 @@ enum event_type {
     EVENT_CONNECTION = 3,
     EVENT_PROFILE = 4,
     EVENT_PROCESS = 5,
+    EVENT_DNS_CHUNK = 6,
 };
 
 enum direction {
@@ -79,6 +86,11 @@ enum operation {
     OP_PAGE_FAULT = 14,
     OP_PROCESS_EXEC = 15,
     OP_PROCESS_EXIT = 16,
+    OP_TCP_HANDSHAKE = 17,
+    OP_TCP_RESET_RECEIVED = 18,
+    OP_TCP_RESET_SENT = 19,
+    OP_TCP_ZERO_WINDOW = 20,
+    OP_TCP_TIMEOUT = 21,
 };
 
 struct trace_event_raw_sys_enter {
@@ -135,7 +147,8 @@ struct pending_read {
     __u8 is_ex;
     __u8 direction;
     __u8 is_network;
-    __u8 padding[3];
+    __u8 protocol;
+    __u8 padding[2];
 };
 
 struct syscall_start {
@@ -147,6 +160,7 @@ struct syscall_start {
 };
 
 struct socket_owner {
+    __u64 connection_key;
     __u32 tgid;
     __s32 fd;
 };
@@ -238,6 +252,27 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u64);
+} handshake_starts SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u64);
+} completed_handshakes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u8);
+} peer_resets_seen SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 32768);
     __type(key, __u64);
     __type(value, __u8);
@@ -270,6 +305,7 @@ struct {
 } events SEC(".maps");
 
 const volatile __u32 capture_bytes = 1024;
+const volatile __u16 mongodb_port = 27017;
 const volatile __u64 rtt_sample_interval_ns = 1000000000ULL;
 const volatile __u64 lock_wait_threshold_ns = 50000ULL;
 const volatile __u64 page_fault_threshold_ns = 100000ULL;
@@ -326,6 +362,7 @@ static __always_inline void submit_chunk_limited(
     __u8 direction,
     __u8 source,
     __u64 connection_key,
+    __u8 event_type,
     __u32 copy_limit)
 {
     if (actual <= 0 || buffer == 0 || copy_limit == 0)
@@ -342,7 +379,7 @@ static __always_inline void submit_chunk_limited(
         bpf_ringbuf_discard(event, 0);
         return;
     }
-    event->event_type = EVENT_IO_CHUNK;
+    event->event_type = event_type;
     event->direction = direction;
     event->source = source;
     event->connection_key = connection_key;
@@ -361,10 +398,11 @@ static __always_inline void submit_chunk(
     __s32 fd,
     __u8 direction,
     __u8 source,
-    __u64 connection_key)
+    __u64 connection_key,
+    __u8 event_type)
 {
     submit_chunk_limited(buffer, requested, actual, fd, direction, source,
-                         connection_key, capture_bytes);
+                         connection_key, event_type, capture_bytes);
 }
 
 static __always_inline void submit_vector_chunks(
@@ -375,7 +413,8 @@ static __always_inline void submit_vector_chunks(
     __s32 fd,
     __u8 direction,
     __u8 source,
-    __u64 connection_key)
+    __u64 connection_key,
+    __u8 event_type)
 {
     if (actual <= 0 || !pointer)
         return;
@@ -413,7 +452,7 @@ static __always_inline void submit_vector_chunks(
             reported_segment <= copied)
             reported_segment = (__u64)copied + 1;
         submit_chunk_limited((__u64)iov.iov_base, iov.iov_len, reported_segment, fd,
-                             direction, source, connection_key, copied);
+                             direction, source, connection_key, event_type, copied);
         remaining = remaining_after;
         budget = budget_after;
         if (reported_segment > copied)
@@ -548,14 +587,16 @@ int handle_sys_exit(struct trace_event_raw_sys_exit *ctx)
             if (copy.is_network)
                 submit_vector_chunks(copy.buffer, copy.requested,
                                      copy.vector_kind == 2, ctx->ret, copy.fd,
-                                     copy.direction, copy.source, copy.connection_key);
+                                     copy.direction, copy.source, copy.connection_key,
+                                     copy.protocol ? EVENT_DNS_CHUNK : EVENT_IO_CHUNK);
         } else {
             __s64 actual = ctx->ret;
             if (actual > 0 && (__u64)actual > copy.requested)
                 actual = copy.requested;
             if (copy.is_network)
                 submit_chunk(copy.buffer, copy.requested, actual, copy.fd,
-                             copy.direction, copy.source, copy.connection_key);
+                             copy.direction, copy.source, copy.connection_key,
+                             copy.protocol ? EVENT_DNS_CHUNK : EVENT_IO_CHUNK);
         }
     }
 
@@ -622,7 +663,7 @@ static __always_inline int ssl_exit(struct pt_regs *ctx, __u8 direction)
             actual = 0;
     }
     submit_chunk(copy.buffer, copy.requested, actual, copy.fd, direction,
-                 SOURCE_OPENSSL, copy.connection_key);
+                 SOURCE_OPENSSL, copy.connection_key, EVENT_IO_CHUNK);
     return 0;
 }
 
@@ -733,12 +774,15 @@ static __always_inline __u64 mix_socket_word(__u64 hash, __u64 value)
     return (hash ^ value) * 1099511628211ULL;
 }
 
-static __always_inline __u64 socket_key(struct sock *sk)
+static __always_inline __u64 socket_handle(struct sock *sk)
 {
-    __s64 stored_cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
-    if (stored_cookie)
-        return (__u64)stored_cookie;
+    /* Kernel socket addresses are stable for the object's lifetime and are
+     * used only as in-kernel map keys; they never cross the ring buffer. */
+    return (__u64)sk;
+}
 
+static __always_inline __u64 socket_connection_key(struct sock *sk)
+{
     __u64 hash = 1469598103934665603ULL;
     hash = mix_socket_word(hash, BPF_CORE_READ(sk, __sk_common.skc_daddr));
     hash = mix_socket_word(hash, BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr));
@@ -757,25 +801,66 @@ static __always_inline __u64 socket_key(struct sock *sk)
     return hash ? hash : 1;
 }
 
+static __always_inline int mark_dns_socket(struct sock *sk)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (!is_target_tgid(pid_tgid >> 32))
+        return 0;
+    struct pending_read *pending = bpf_map_lookup_elem(&pending_reads, &pid_tgid);
+    if (!pending)
+        return 0;
+    pending->connection_key = socket_connection_key(sk);
+    pending->is_network = 1;
+    pending->protocol = 1;
+    return 0;
+}
+
+SEC("kprobe/udp_sendmsg")
+int BPF_KPROBE(handle_udp_sendmsg, struct sock *sk)
+{
+    return mark_dns_socket(sk);
+}
+
+SEC("kprobe/udp_recvmsg")
+int BPF_KPROBE(handle_udp_recvmsg, struct sock *sk)
+{
+    return mark_dns_socket(sk);
+}
+
+SEC("kprobe/udpv6_sendmsg")
+int BPF_KPROBE(handle_udpv6_sendmsg, struct sock *sk)
+{
+    return mark_dns_socket(sk);
+}
+
+SEC("kprobe/udpv6_recvmsg")
+int BPF_KPROBE(handle_udpv6_recvmsg, struct sock *sk)
+{
+    return mark_dns_socket(sk);
+}
+
 static __always_inline int track_socket(struct sock *sk)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 tgid = pid_tgid >> 32;
     if (!is_target_tgid(tgid))
         return 0;
-    __u64 cookie = socket_key(sk);
+    __u64 handle = socket_handle(sk);
     struct pending_read *pending = bpf_map_lookup_elem(&pending_reads, &pid_tgid);
+    struct socket_owner *existing = bpf_map_lookup_elem(&tracked_sockets, &handle);
     struct socket_owner owner = {
+        .connection_key = existing
+            ? existing->connection_key
+            : mix_socket_word(socket_connection_key(sk), bpf_ktime_get_ns()),
         .tgid = tgid,
         .fd = pending ? pending->fd : -1,
     };
-    struct socket_owner *existing = bpf_map_lookup_elem(&tracked_sockets, &cookie);
     if (owner.fd < 0 && existing)
         owner.fd = existing->fd;
-    if (cookie)
-        bpf_map_update_elem(&tracked_sockets, &cookie, &owner, BPF_ANY);
-    if (pending && cookie)
-        pending->connection_key = cookie;
+    if (handle)
+        bpf_map_update_elem(&tracked_sockets, &handle, &owner, BPF_ANY);
+    if (pending && handle)
+        pending->connection_key = owner.connection_key;
     if (pending)
         pending->is_network = 1;
     return 0;
@@ -795,10 +880,10 @@ int BPF_KPROBE(handle_tcp_recvmsg, struct sock *sk)
 
 static __always_inline void submit_connection(struct sock *sk, __u8 operation, __u64 duration_ns)
 {
-    __u64 cookie = socket_key(sk);
-    if (!cookie)
+    __u64 handle = socket_handle(sk);
+    if (!handle)
         return;
-    struct socket_owner *owner = bpf_map_lookup_elem(&tracked_sockets, &cookie);
+    struct socket_owner *owner = bpf_map_lookup_elem(&tracked_sockets, &handle);
     if (!owner)
         return;
     struct socket_owner copy = *owner;
@@ -808,7 +893,7 @@ static __always_inline void submit_connection(struct sock *sk, __u8 operation, _
     event->event_type = EVENT_CONNECTION;
     event->source = SOURCE_KERNEL;
     event->operation = operation;
-    event->connection_key = cookie;
+    event->connection_key = copy.connection_key;
     event->duration_ns = duration_ns;
     event->pid = copy.tgid;
     event->tgid = copy.tgid;
@@ -823,7 +908,48 @@ int BPF_KPROBE(handle_tcp_connect, struct sock *sk)
     if (!is_target_tgid(pid_tgid >> 32))
         return 0;
     track_socket(sk);
+    __u64 handle = socket_handle(sk);
+    __u64 now = bpf_ktime_get_ns();
+    bpf_map_update_elem(&handshake_starts, &handle, &now, BPF_ANY);
     submit_connection(sk, OP_TCP_CONNECT, 0);
+    return 0;
+}
+
+SEC("kprobe/tcp_set_state")
+int BPF_KPROBE(handle_tcp_state, struct sock *sk, int newstate)
+{
+    __u64 handle = socket_handle(sk);
+    struct socket_owner *owner = bpf_map_lookup_elem(&tracked_sockets, &handle);
+    __u16 local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
+    if (!owner && local_port != mongodb_port)
+        return 0;
+    __u64 now = bpf_ktime_get_ns();
+    if (newstate == TCP_SYN_SENT_STATE || newstate == TCP_SYN_RECV_STATE) {
+        bpf_map_update_elem(&handshake_starts, &handle, &now, BPF_ANY);
+        return 0;
+    }
+    __u64 *started = bpf_map_lookup_elem(&handshake_starts, &handle);
+    if (newstate == TCP_ESTABLISHED_STATE) {
+        __u64 duration = started ? now - *started : 0;
+        if (owner)
+            submit_connection(sk, OP_TCP_HANDSHAKE, duration);
+        else
+            bpf_map_update_elem(&completed_handshakes, &handle, &duration, BPF_ANY);
+        if (started)
+            bpf_map_delete_elem(&handshake_starts, &handle);
+    } else if (newstate == TCP_CLOSE_STATE) {
+        __u8 *reset_seen = bpf_map_lookup_elem(&peer_resets_seen, &handle);
+        int socket_error = BPF_CORE_READ(sk, sk_err);
+        if (owner && !reset_seen && socket_error == ECONNRESET_CODE)
+            submit_connection(sk, OP_TCP_RESET_RECEIVED, 0);
+        if (owner && socket_error == ETIMEDOUT_CODE)
+            submit_connection(sk, OP_TCP_TIMEOUT, started ? now - *started : 0);
+        bpf_map_delete_elem(&peer_resets_seen, &handle);
+        if (started) {
+            bpf_map_delete_elem(&handshake_starts, &handle);
+        }
+        bpf_map_delete_elem(&completed_handshakes, &handle);
+    }
     return 0;
 }
 
@@ -837,44 +963,78 @@ int BPF_KRETPROBE(handle_tcp_accept, struct sock *sk)
         return 0;
     track_socket(sk);
     submit_connection(sk, OP_TCP_ACCEPT, 0);
+    __u64 handle = socket_handle(sk);
+    __u64 *duration = bpf_map_lookup_elem(&completed_handshakes, &handle);
+    if (duration) {
+        submit_connection(sk, OP_TCP_HANDSHAKE, *duration);
+        bpf_map_delete_elem(&completed_handshakes, &handle);
+    } else
+        submit_connection(sk, OP_TCP_HANDSHAKE, 0);
     return 0;
 }
 
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(handle_tcp_close, struct sock *sk)
 {
-    __u64 cookie = socket_key(sk);
-    if (!bpf_map_lookup_elem(&tracked_sockets, &cookie))
+    __u64 handle = socket_handle(sk);
+    struct socket_owner *owner = bpf_map_lookup_elem(&tracked_sockets, &handle);
+    bpf_map_delete_elem(&handshake_starts, &handle);
+    bpf_map_delete_elem(&completed_handshakes, &handle);
+    if (!owner)
         return 0;
     submit_connection(sk, OP_TCP_CLOSE, 0);
-    bpf_map_delete_elem(&tracked_sockets, &cookie);
-    bpf_map_delete_elem(&rtt_last_emit, &cookie);
+    bpf_map_delete_elem(&tracked_sockets, &handle);
+    bpf_map_delete_elem(&rtt_last_emit, &handle);
+    bpf_map_delete_elem(&peer_resets_seen, &handle);
     return 0;
 }
 
 SEC("kprobe/tcp_rcv_established")
 int BPF_KPROBE(handle_tcp_rtt, struct sock *sk)
 {
-    __u64 cookie = socket_key(sk);
-    if (!bpf_map_lookup_elem(&tracked_sockets, &cookie))
+    __u64 handle = socket_handle(sk);
+    if (!bpf_map_lookup_elem(&tracked_sockets, &handle))
         return 0;
     __u64 now = bpf_ktime_get_ns();
-    __u64 *last = bpf_map_lookup_elem(&rtt_last_emit, &cookie);
+    __u64 *last = bpf_map_lookup_elem(&rtt_last_emit, &handle);
     if (last && now - *last < rtt_sample_interval_ns)
         return 0;
-    bpf_map_update_elem(&rtt_last_emit, &cookie, &now, BPF_ANY);
+    bpf_map_update_elem(&rtt_last_emit, &handle, &now, BPF_ANY);
     __u32 srtt_us = BPF_CORE_READ((struct tcp_sock *)sk, srtt_us) >> 3;
     submit_connection(sk, OP_TCP_RTT, (__u64)srtt_us * 1000ULL);
+    if (BPF_CORE_READ((struct tcp_sock *)sk, snd_wnd) == 0)
+        submit_connection(sk, OP_TCP_ZERO_WINDOW, 0);
     return 0;
 }
 
 SEC("kprobe/tcp_retransmit_skb")
 int BPF_KPROBE(handle_tcp_retransmit, struct sock *sk, struct sk_buff *skb)
 {
-    __u64 cookie = socket_key(sk);
-    if (!bpf_map_lookup_elem(&tracked_sockets, &cookie))
+    __u64 handle = socket_handle(sk);
+    if (!bpf_map_lookup_elem(&tracked_sockets, &handle))
         return 0;
     submit_connection(sk, OP_TCP_RETRANSMIT, 0);
+    return 0;
+}
+
+SEC("kprobe/tcp_reset")
+int BPF_KPROBE(handle_tcp_reset, struct sock *sk)
+{
+    __u64 handle = socket_handle(sk);
+    if (bpf_map_lookup_elem(&tracked_sockets, &handle)) {
+        submit_connection(sk, OP_TCP_RESET_RECEIVED, 0);
+        __u8 seen = 1;
+        bpf_map_update_elem(&peer_resets_seen, &handle, &seen, BPF_ANY);
+    }
+    return 0;
+}
+
+SEC("kprobe/tcp_send_active_reset")
+int BPF_KPROBE(handle_tcp_active_reset, struct sock *sk)
+{
+    __u64 handle = socket_handle(sk);
+    if (bpf_map_lookup_elem(&tracked_sockets, &handle))
+        submit_connection(sk, OP_TCP_RESET_SENT, 0);
     return 0;
 }
 

@@ -158,6 +158,7 @@ pub enum EventPayload {
     MongodbActivity(MongodbActivity),
     MongodbConnection(MongodbConnection),
     MongodbAuth(MongodbAuth),
+    DnsActivity(DnsActivity),
     HostIo(HostIo),
     Profile(ProfileSample),
     ProcessLifecycle(ProcessLifecycle),
@@ -238,6 +239,25 @@ pub struct MongodbAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub succeeded: Option<bool>,
     pub connection_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DnsActivity {
+    pub operation: String,
+    pub transport: String,
+    pub query_id: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_code: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_count: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_us: Option<u64>,
+    pub connection: ConnectionMetadata,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

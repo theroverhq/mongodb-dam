@@ -61,19 +61,21 @@ spec:
             - name: OBSERVER_PRINCIPAL_HASH_SALT_FILE
               value: /var/run/mongodb-dam/secrets/principal-hash-salt
             - name: OBSERVER_CPU_PROFILE_HZ
-              value: {{ .Values.observer.cpuProfileHz | quote }}
+              value: {{ int64 .Values.observer.cpuProfileHz | quote }}
+            - name: OBSERVER_MONGODB_PORT
+              value: {{ int64 .Values.observer.mongodbPort | quote }}
             - name: OBSERVER_TLS_UPROBES
               value: {{ .Values.observer.tlsUprobes | quote }}
             - name: OBSERVER_LOCK_PROFILING
               value: {{ .Values.observer.lockProfiling | quote }}
             - name: OBSERVER_MAX_MESSAGE_BYTES
-              value: {{ .Values.observer.maxMessageBytes | quote }}
+              value: {{ int64 .Values.observer.maxMessageBytes | quote }}
             - name: OBSERVER_BATCH_MAX_EVENTS
-              value: {{ .Values.observer.batchMaxEvents | quote }}
+              value: {{ int64 .Values.observer.batchMaxEvents | quote }}
             - name: OBSERVER_BATCH_FLUSH_MILLISECONDS
-              value: {{ .Values.observer.batchFlushMilliseconds | quote }}
+              value: {{ int64 .Values.observer.batchFlushMilliseconds | quote }}
             - name: OBSERVER_SPOOL_MAX_BYTES
-              value: {{ .Values.observer.spoolMaxBytes | quote }}
+              value: {{ int64 .Values.observer.spoolMaxBytes | quote }}
           ports:
             - name: metrics
               containerPort: 8091

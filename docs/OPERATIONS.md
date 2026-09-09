@@ -4,7 +4,7 @@
 
 Observer exits if its required raw-syscall/scheduler programs cannot load. Its `/ready` endpoint becomes healthy only after the eBPF object and ring buffer are active. Optional kernel probes log a structured warning when a symbol is unavailable.
 
-Outpost `/ready` verifies access to its spool. Regional Collect availability does not make it unready: temporary regional loss is absorbed by the PVC and exposed through spool and delivery-failure metrics.
+Outpost `/ready` verifies access to its spool. Regional endpoint availability does not make it unready: temporary regional loss is absorbed by the PVC and exposed through spool and delivery-failure metrics.
 
 ## Metrics
 
@@ -34,6 +34,10 @@ Default caps are 256 MiB per node for Observer and 1 GiB for Outpost. Size them 
 - `off`: do not attempt TLS uprobes.
 
 Do not silently use `auto` for a compliance policy that requires command visibility over TLS. Alert on `mongodb_dam_observer_tls_uprobe_processes` and qualify the exact MongoDB image.
+
+## Destination credential rotation
+
+Update the `bearer-token` key in the configured Kubernetes Secret, then restart the Outpost Deployment so it reads the new value. The endpoint is posted exactly as configured and redirects are not followed. A private endpoint CA may be supplied through `destination.caSecretName`.
 
 ## Upgrades
 

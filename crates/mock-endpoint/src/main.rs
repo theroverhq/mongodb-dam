@@ -19,18 +19,22 @@ use tracing_subscriber::EnvFilter;
 #[command(
     author,
     version,
-    about = "Local mock for the future Collect HTTP-push endpoint"
+    about = "Local mock for the regional HTTP-push endpoint"
 )]
 struct Cli {
-    #[arg(long, env = "MOCK_COLLECT_LISTEN_ADDR", default_value = "0.0.0.0:8088")]
+    #[arg(
+        long,
+        env = "MOCK_ENDPOINT_LISTEN_ADDR",
+        default_value = "0.0.0.0:8088"
+    )]
     listen_addr: SocketAddr,
     #[arg(
         long,
-        env = "MOCK_COLLECT_TOKEN",
+        env = "MOCK_ENDPOINT_BEARER_TOKEN",
         default_value = "local-development-token"
     )]
     token: String,
-    #[arg(long, env = "MOCK_COLLECT_OUTPUT_DIR")]
+    #[arg(long, env = "MOCK_ENDPOINT_OUTPUT_DIR")]
     output_dir: Option<PathBuf>,
 }
 
@@ -78,15 +82,15 @@ async fn main() -> Result<()> {
         .with_state(state);
     let listener = TcpListener::bind(cli.listen_addr)
         .await
-        .with_context(|| format!("binding mock Collect to {}", cli.listen_addr))?;
-    info!(address = %cli.listen_addr, "mock Collect listening");
+        .with_context(|| format!("binding mock endpoint to {}", cli.listen_addr))?;
+    info!(address = %cli.listen_addr, "mock endpoint listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
-        service: "mock-collect",
+        service: "mock-endpoint",
         status: "ok",
         received_batches: state.seen.lock().await.len(),
     })
@@ -98,9 +102,10 @@ async fn ingest(
     body: Bytes,
 ) -> impl IntoResponse {
     let token = headers
-        .get("x-rover-collect-token")
+        .get("authorization")
         .and_then(|value| value.to_str().ok());
-    if token != Some(state.token.as_str()) {
+    let expected = format!("Bearer {}", state.token);
+    if token != Some(expected.as_str()) {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
     let Some(idempotency_key) = headers

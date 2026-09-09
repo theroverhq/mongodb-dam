@@ -1,18 +1,20 @@
-# Regional Collect HTTP-push contract
+# Regional endpoint HTTP-push contract
 
-This is the customer-side contract to implement in Command and Collect next. The current Foundry, Command, Collect, and connector-catalog repositories have not been modified.
+Outpost treats the destination as an opaque regional ingress endpoint. It does not address Collect directly and has no dependency on the eventual regional routing implementation. The current Foundry, Command, Collect, and connector-catalog repositories have not been modified.
 
 ## Request
 
-`POST /v1/ingest/mongodb-dam`
+`POST <the exact configured OUTPOST_ENDPOINT>`
+
+The examples use `/v1/ingest/mongodb-dam`, but the customer-side code does not append or assume a path. Redirects are deliberately not followed so a bearer token cannot be forwarded to another origin.
 
 Headers:
 
 - `content-type: application/json`
-- `x-rover-collect-token: <source credential>` by default; the header name is configurable in Outpost.
-- `idempotency-key: <batch_id>` by default; the header name is configurable in Outpost.
+- `authorization: Bearer <source credential>`
+- `idempotency-key: <batch_id>`
 
-Body: one `DamBatch` from `crates/schema`, with `schema_version: 1`. Identity fields are repeated on the batch and every event so Collect can reject cross-customer or cross-source injection before persistence.
+Body: one `DamBatch` from `crates/schema`, with `schema_version: 1`. Identity fields are repeated on the batch and every event so the regional ingress can reject cross-customer or cross-source injection before persistence or forwarding.
 
 ## Required receiver behavior
 
@@ -20,7 +22,7 @@ Body: one `DamBatch` from `crates/schema`, with `schema_version: 1`. Identity fi
 2. Enforce a compressed and uncompressed request-size limit. Outpost defaults to 5 MiB per Observer-to-Outpost batch.
 3. Parse with unknown-field rejection and validate every repeated identity against the credential assignment.
 4. Use `(source_id, batch_id)` as the idempotency key before producing downstream records.
-5. Return `202 Accepted` only after the regional durability boundary is crossed.
+5. Return `202 Accepted` only after the regional durability boundary is crossed. Internal forwarding to Collect or another service happens behind this endpoint.
 6. Return `409 Conflict` for an already accepted idempotency key; Outpost treats that as acknowledged.
 7. Return `429` or `5xx` for retryable failures. Outpost retains and retries the batch.
 8. Return other `4xx` statuses for permanent contract/auth failures. Outpost retains these for operator review rather than deleting them.
@@ -52,4 +54,4 @@ Credential material should be stored through the existing secret-management boun
 
 ## Mock
 
-`mock-collect` implements the success, authentication, schema validation, and duplicate response behavior. It is deliberately not a production receiver and keeps idempotency state only in memory.
+`mock-endpoint` implements the success, bearer authentication, schema validation, and duplicate response behavior. It is deliberately not a production receiver and keeps idempotency state only in memory.

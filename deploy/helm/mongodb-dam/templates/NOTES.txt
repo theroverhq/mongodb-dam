@@ -10,4 +10,4 @@ Verify the rollout:
 
 Observer needs privileged pods, host PID access, BTF, and tracefs on every selected Linux node.
 Outpost sends metadata batches only to:
-  {{ .Values.collect.url }}
+  {{ .Values.destination.endpoint }}
