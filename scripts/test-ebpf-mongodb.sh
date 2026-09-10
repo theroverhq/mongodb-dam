@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command_name in docker grep mktemp python3 sha256sum; do
+for command_name in docker grep jq mktemp python3 sha256sum; do
   command -v "$command_name" >/dev/null || {
     printf 'Missing required command: %s\n' "$command_name" >&2
     exit 1
@@ -16,6 +16,7 @@ outpost="mongodb-dam-ebpf-outpost-$run_id"
 observer="mongodb-dam-ebpf-observer-$run_id"
 mongodb="mongodb-dam-ebpf-mongodb-$run_id"
 output_dir="$(mktemp -d)"
+mapping_dir="$(mktemp -d)"
 mongodb_image="${MONGODB_TEST_IMAGE:-mongo:8.0.29-noble}"
 secret_value="private-value-that-must-not-leave-node"
 mongodb_root_user="dam-admin"
@@ -32,6 +33,26 @@ principal_digest="$(
 )"
 principal_digest="${principal_digest%% *}"
 expected_principal="sha256:$principal_digest"
+expected_iam_principal='arn:aws:iam::111122223333:user/dam-demo-alice'
+expected_secret_arn='arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam-demo-AbCdEf'
+jq -n \
+  --arg principal "$expected_principal" \
+  --arg iam "$expected_iam_principal" \
+  --arg secret "$expected_secret_arn" \
+  '{
+    schema_version: 1,
+    mappings: [{
+      mongodb_principal_hash: $principal,
+      provider: "aws",
+      principal_type: "iam_user",
+      principal_arn: $iam,
+      account_id: "111122223333",
+      credential_source: "aws_secrets_manager",
+      credential_resource: $secret
+    }]
+  }' >"$mapping_dir/identity-mapping.json"
+chmod 0755 "$mapping_dir"
+chmod 0644 "$mapping_dir/identity-mapping.json"
 
 cleanup() {
   docker rm --force "$observer" "$outpost" "$mock" "$mongodb" >/dev/null 2>&1 || true
@@ -40,6 +61,9 @@ cleanup() {
     printf 'Preserved test endpoint output: %s\n' "$output_dir" >&2
   elif [[ -n "$output_dir" && -d "$output_dir" ]]; then
     rm -rf -- "$output_dir"
+  fi
+  if [[ -n "$mapping_dir" && -d "$mapping_dir" ]]; then
+    rm -rf -- "$mapping_dir"
   fi
 }
 trap cleanup EXIT
@@ -81,6 +105,7 @@ docker run --detach --rm \
   --tmpfs /var/lib/mongodb-dam/outpost:rw,uid=65532,gid=65532,size=67108864 \
   --mount "type=bind,src=$repo_root/tests/fixtures/bearer-token.txt,dst=/run/secrets/bearer-token,readonly" \
   --mount "type=bind,src=$repo_root/tests/fixtures/internal-token.txt,dst=/run/secrets/internal-token,readonly" \
+  --mount "type=bind,src=$mapping_dir/identity-mapping.json,dst=/run/identity/identity-mapping.json,readonly" \
   -e DAM_CUSTOMER_ID=integration-customer \
   -e DAM_TENANT_ID=integration-tenant \
   -e DAM_SOURCE_ID=integration-source \
@@ -89,6 +114,7 @@ docker run --detach --rm \
   -e OUTPOST_INTERNAL_TOKEN_FILE=/run/secrets/internal-token \
   -e OUTPOST_ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam \
   -e OUTPOST_BEARER_TOKEN_FILE=/run/secrets/bearer-token \
+  -e OUTPOST_IDENTITY_MAPPING_FILE=/run/identity/identity-mapping.json \
   -e OUTPOST_EXPORT_INTERVAL_SECONDS=1 \
   mongodb-dam-outpost:dev >/dev/null
 
@@ -199,10 +225,9 @@ for _ in $(seq 1 100); do
     && grep -Rqs '"command":"aggregate"' "$output_dir" \
     && grep -Rqs '"command":"update"' "$output_dir" \
     && grep -Rqs '"command":"delete"' "$output_dir" \
-    && grep -Rqs '"event_type":"security_finding"' "$output_dir" \
-    && grep -Rqs '"rule_id":"mongodb.bulk_delete"' "$output_dir" \
-    && grep -Rqs "\"rule_id\":\"mongodb.bulk_delete\".*\"principal\":\"$expected_principal\"" "$output_dir" \
-    && grep -Rqs '"affected_documents":35' "$output_dir" \
+    && grep -Rqs "\"event_type\":\"mongodb_activity\",\"details\":{\"command\":\"delete\",\"database\":\"dam_e2e\",\"collection\":\"customer_records\",\"principal\":\"$expected_principal\",\"principal_hashed\":true,\"delete_scope\":\"multi\",\"delete_statements\":1,\"affected_documents\":35" "$output_dir" \
+    && grep -Rqs "\"principal_arn\":\"$expected_iam_principal\"" "$output_dir" \
+    && grep -Rqs "\"credential_resource\":\"$expected_secret_arn\"" "$output_dir" \
     && grep -Rqs '"state":"handshake_established"' "$output_dir" \
     && grep -Rqs '"reason":"peer_reset"' "$output_dir"; then
     captured=true
@@ -226,42 +251,10 @@ if grep -Rqs "$direct_user" "$output_dir"; then
   printf '%s\n' 'Privacy failure: a clear MongoDB principal crossed the endpoint boundary.' >&2
   exit 1
 fi
-
-docker exec "$mongodb" mongosh --quiet mongodb://127.0.0.1:27017 --eval "
-const admin = db.getSiblingDB('admin');
-admin.revokeRolesFromUser('$direct_user', [{role: 'readWrite', db: 'dam_e2e'}]);
-const killed = admin.runCommand({killAllSessions: [{user: '$direct_user', db: 'admin'}]});
-if (killed.ok !== 1) throw new Error('killAllSessions failed');
-" --username "$mongodb_root_user" --password "$mongodb_root_password" \
-  --authenticationDatabase admin >/dev/null
-
-set +e
-blocked_output="$(docker exec "$mongodb" mongosh --quiet mongodb://127.0.0.1:27017 --eval "
-db.getSiblingDB('dam_e2e').customer_records.findOne({demo_batch: 'integration-bulk-delete'});
-" --username "$direct_user" --password "$direct_password" \
-  --authenticationDatabase admin 2>&1)"
-blocked_exit=$?
-set -e
-if [[ "$blocked_exit" -eq 0 ]] || ! grep -Eqi 'unauthorized|not authorized' <<<"$blocked_output"; then
+if grep -Rqs '"event_type":"security_finding"' "$output_dir"; then
   diagnostics
-  printf '%s\n' 'Containment failure: the direct user was not denied after role revocation.' >&2
-  printf '%s\n' "$blocked_output" >&2
+  printf '%s\n' 'Capture-only contract failure: Observer emitted a security finding.' >&2
   exit 1
 fi
 
-denied_captured=false
-for _ in $(seq 1 100); do
-  if grep -Rqs "\"command\":\"find\".*\"principal\":\"$expected_principal\".*\"succeeded\":false.*\"error_code\":13" \
-    "$output_dir"; then
-    denied_captured=true
-    break
-  fi
-  sleep 0.2
-done
-if [[ "$denied_captured" != true ]]; then
-  diagnostics
-  printf '%s\n' 'Timed out waiting for the principal-attributed denied query event.' >&2
-  exit 1
-fi
-
-printf '%s\n' 'Live eBPF MongoDB metadata, SCRAM attribution, bulk-delete finding, containment, denied-query evidence, TCP lifecycle, and redaction tests passed.'
+printf '%s\n' 'Live eBPF MongoDB metadata, SCRAM attribution, IAM enrichment, bulk-delete activity, TCP lifecycle, and redaction tests passed.'

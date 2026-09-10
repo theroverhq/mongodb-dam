@@ -28,8 +28,13 @@ namespace="${NAMESPACE:-mongodb-dam}"
 release="${RELEASE:-mongodb-dam}"
 secret_name="${SECRET_NAME:-mongodb-dam-secrets}"
 mapping_secret="${DIRECT_USER_MAPPING_SECRET:-mongodb-dam-demo-direct-user}"
+mapping_key="${DIRECT_USER_MAPPING_KEY:-identity-mapping.json}"
 aws_secret_id="${DEMO_AWS_SECRET_ID:-mongodb-dam/demo/direct-user}"
 database="${DEMO_DATABASE:-dam_demo}"
+if [[ ! "$mapping_key" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  printf '%s\n' 'DIRECT_USER_MAPPING_KEY must be a single Kubernetes Secret data key.' >&2
+  exit 1
+fi
 
 admin_account="$(aws --region "$AWS_REGION" sts get-caller-identity --query Account --output text)"
 principal_account="$(cut -d: -f5 <<<"$DEMO_IAM_PRINCIPAL_ARN")"
@@ -45,6 +50,28 @@ mongodb_pod="$(kubectl -n "$namespace" get pods \
   -o jsonpath='{.items[0].metadata.name}')"
 if [[ -z "$mongodb_pod" ]]; then
   printf '%s\n' 'MongoDB pod was not found. Deploy the demo first.' >&2
+  exit 1
+fi
+mapping_path="/var/run/mongodb-dam/identity/$mapping_key"
+if ! kubectl -n "$namespace" get "deployment/${release}-outpost" -o json \
+  | jq -e --arg secret "$mapping_secret" --arg key "$mapping_key" \
+      --arg path "$mapping_path" '
+        ([.spec.template.spec.containers[]
+          | select(.name == "outpost")
+          | .env[]?
+          | select(.name == "OUTPOST_IDENTITY_MAPPING_FILE" and .value == $path)]
+          | length) == 1
+        and
+        ([.spec.template.spec.volumes[]?
+          | select(
+              .name == "identity-mapping"
+              and .secret.secretName == $secret
+              and any(.secret.items[]?; .key == $key and .path == $key)
+            )]
+          | length) == 1
+      ' >/dev/null; then
+  printf 'Outpost is not configured for mapping Secret %s key %s. Deploy in demo mode with matching DIRECT_USER_MAPPING_* values.\n' \
+    "$mapping_secret" "$mapping_key" >&2
   exit 1
 fi
 
@@ -145,18 +172,52 @@ aws --region "$AWS_REGION" secretsmanager put-resource-policy \
   --block-public-policy >/dev/null
 
 mapping_manifest="$tmp_dir/mapping-secret.yaml"
+identity_mapping_file="$tmp_dir/identity-mapping.json"
+secret_arn="$(aws --region "$AWS_REGION" secretsmanager describe-secret \
+  --secret-id "$aws_secret_id" --query ARN --output text)"
+if [[ "$DEMO_IAM_PRINCIPAL_ARN" == *":user/"* ]]; then
+  principal_type=iam_user
+else
+  principal_type=iam_role
+fi
+jq -n \
+  --arg mongodb_principal_hash "$principal_hash" \
+  --arg principal_type "$principal_type" \
+  --arg principal_arn "$DEMO_IAM_PRINCIPAL_ARN" \
+  --arg account_id "$principal_account" \
+  --arg credential_resource "$secret_arn" \
+  '{
+    schema_version: 1,
+    mappings: [{
+      mongodb_principal_hash: $mongodb_principal_hash,
+      provider: "aws",
+      principal_type: $principal_type,
+      principal_arn: $principal_arn,
+      account_id: $account_id,
+      credential_source: "aws_secrets_manager",
+      credential_resource: $credential_resource
+    }]
+  }' >"$identity_mapping_file"
+chmod 600 "$identity_mapping_file"
+
 kubectl -n "$namespace" create secret generic "$mapping_secret" \
   --from-literal="iam-principal-arn=$DEMO_IAM_PRINCIPAL_ARN" \
   --from-literal="mongo-username=$mongo_username" \
   --from-literal="principal-hash=$principal_hash" \
   --from-literal="aws-secret-id=$aws_secret_id" \
+  --from-literal="aws-secret-arn=$secret_arn" \
+  --from-literal="aws-account-id=$principal_account" \
+  --from-literal="principal-type=$principal_type" \
   --from-literal="database=$database" \
   --from-literal='status=active' \
+  --from-file="$mapping_key=$identity_mapping_file" \
   --dry-run=client -o yaml >"$mapping_manifest"
 kubectl apply -f "$mapping_manifest" >/dev/null
 
-secret_arn="$(aws --region "$AWS_REGION" secretsmanager describe-secret \
-  --secret-id "$aws_secret_id" --query ARN --output text)"
+kubectl -n "$namespace" rollout restart "deployment/${release}-outpost" >/dev/null
+kubectl -n "$namespace" rollout status "deployment/${release}-outpost" \
+  --timeout="${DEPLOY_TIMEOUT:-3m}" >/dev/null
+
 printf '\nDirect-user mapping provisioned.\n'
 printf 'IAM principal:       %s\n' "$DEMO_IAM_PRINCIPAL_ARN"
 printf 'MongoDB user:        %s (SCRAM, readWrite on %s)\n' "$mongo_username" "$database"

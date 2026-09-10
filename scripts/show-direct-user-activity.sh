@@ -20,6 +20,7 @@ fi
 
 namespace="${NAMESPACE:-mongodb-dam}"
 mapping_secret="${DIRECT_USER_MAPPING_SECRET:-mongodb-dam-demo-direct-user}"
+receiver_service="${DEMO_RECEIVER_SERVICE:-mock-endpoint}"
 receiver_port="${DEMO_RECEIVER_LOCAL_PORT:-18088}"
 run_marker_file="${DIRECT_USER_RUN_MARKER_FILE:-/tmp/mongodb-dam-direct-user-last-run-$UID}"
 not_before_epoch="${DIRECT_USER_NOT_BEFORE_EPOCH:-}"
@@ -35,10 +36,18 @@ if [[ ! "$not_before_epoch" =~ ^[0-9]+$ ]]; then
   printf '%s\n' 'The direct-user run marker must contain Unix epoch seconds.' >&2
   exit 1
 fi
-iam_principal="$(kubectl -n "$namespace" get secret "$mapping_secret" \
-  -o jsonpath='{.data.iam-principal-arn}' | base64 --decode)"
-principal_hash="$(kubectl -n "$namespace" get secret "$mapping_secret" \
-  -o jsonpath='{.data.principal-hash}' | base64 --decode)"
+
+read_mapping_field() {
+  kubectl -n "$namespace" get secret "$mapping_secret" \
+    -o "jsonpath={.data.$1}" | base64 --decode
+}
+
+iam_principal="$(read_mapping_field iam-principal-arn)"
+principal_hash="$(read_mapping_field principal-hash)"
+database="$(read_mapping_field database)"
+aws_account_id="$(read_mapping_field aws-account-id)"
+principal_type="$(read_mapping_field principal-type)"
+secret_arn="$(read_mapping_field aws-secret-arn)"
 
 tmp_dir="$(mktemp -d)"
 forward_pid=''
@@ -51,48 +60,68 @@ cleanup() {
 }
 trap cleanup EXIT
 
-kubectl -n "$namespace" port-forward service/mock-endpoint \
+kubectl -n "$namespace" port-forward "service/$receiver_service" \
   "$receiver_port:8088" >"$tmp_dir/port-forward.log" 2>&1 &
 forward_pid=$!
 
-finding_file="$tmp_dir/finding.json"
+activity_file="$tmp_dir/activity.json"
 found=false
 for _ in $(seq 1 120); do
   if curl --fail --silent \
     --header "authorization: Bearer $BEARER_TOKEN" \
     "http://127.0.0.1:$receiver_port/v1/batches?limit=250" 2>/dev/null \
     | jq --arg principal "$principal_hash" --arg iam "$iam_principal" \
+      --arg account "$aws_account_id" --arg principal_type "$principal_type" \
+      --arg secret "$secret_arn" --arg database "$database" \
       --argjson not_before "$not_before_epoch" '
         def event_epoch:
           (.observed_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601);
         [.batches[].events[]
           | select(
-              .event_type == "security_finding"
-              and .details.rule_id == "mongodb.bulk_delete"
+              .event_type == "mongodb_activity"
+              and .details.command == "delete"
+              and .details.database == $database
+              and .details.collection == "customer_records"
               and .details.principal == $principal
+              and .details.principal_hashed == true
+              and .details.delete_scope == "multi"
+              and .identity.provider == "aws"
+              and .identity.principal_type == $principal_type
+              and .identity.principal_arn == $iam
+              and .identity.account_id == $account
+              and .identity.credential_source == "aws_secrets_manager"
+              and .identity.credential_resource == $secret
               and event_epoch >= $not_before
             )]
         | sort_by(.observed_at)
         | last
         | if . == null then empty else {
             observed_at,
-            severity: .details.severity,
-            rule_id: .details.rule_id,
-            title: .details.title,
-            iam_principal_arn: $iam,
+            iam_principal_arn: .identity.principal_arn,
+            aws_account_id: .identity.account_id,
+            credential_source: .identity.credential_source,
+            credential_secret_arn: .identity.credential_resource,
             mongodb_principal_hash: .details.principal,
+            command: .details.command,
             database: .details.database,
             collection: .details.collection,
             delete_scope: .details.delete_scope,
+            delete_statements: .details.delete_statements,
             affected_documents: .details.affected_documents,
-            threshold_documents: .details.threshold_documents,
-            action: .details.action,
-            connection_id: .details.connection_id,
-            source: .capture.source,
-            pod: .kubernetes.pod_name
+            succeeded: .details.succeeded,
+            error_code: .details.error_code,
+            error_name: .details.error_name,
+            duration_us: .details.duration_us,
+            request_bytes: .details.request_bytes,
+            response_bytes: .details.response_bytes,
+            connection_id: .details.connection.connection_id,
+            remote: .details.connection.remote,
+            capture_source: .capture.source,
+            pod: .kubernetes.pod_name,
+            node: .capture.node_name
           } end
-      ' >"$finding_file"; then
-    if [[ -s "$finding_file" ]]; then
+      ' >"$activity_file"; then
+    if [[ -s "$activity_file" ]]; then
       found=true
       break
     fi
@@ -105,9 +134,9 @@ for _ in $(seq 1 120); do
 done
 
 if [[ "$found" != true ]]; then
-  printf '%s\n' 'Timed out waiting for the mapped user bulk-delete finding.' >&2
+  printf '%s\n' 'Timed out waiting for the mapped user bulk-delete activity at the Outpost destination.' >&2
   exit 1
 fi
 
-printf '%s\n' 'DAM finding (clear IAM identity is joined locally from the protected mapping):'
-jq . "$finding_file"
+printf '%s\n' 'Outpost-delivered MongoDB activity enriched with the protected demo IAM mapping:'
+jq . "$activity_file"

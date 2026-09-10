@@ -21,6 +21,11 @@ if [[ "$demo_mode" != "true" && "$demo_mode" != "false" ]]; then
   printf '%s\n' 'DEMO_MODE must be true or false.' >&2
   exit 1
 fi
+if [[ "$demo_mode" == "true" \
+  && ! "${DIRECT_USER_MAPPING_KEY:-identity-mapping.json}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  printf '%s\n' 'DIRECT_USER_MAPPING_KEY must be a single Kubernetes Secret data key.' >&2
+  exit 1
+fi
 if [[ "$ENDPOINT" != https://* \
   && !( "$demo_mode" == "true" \
     && "$ENDPOINT" == "http://mock-endpoint:8088/v1/ingest/mongodb-dam" ) ]]; then
@@ -39,6 +44,8 @@ demo_api_repository="${DEMO_API_IMAGE_REPOSITORY:-mongodb-dam-demo-api}"
 demo_receiver_repository="${DEMO_RECEIVER_IMAGE_REPOSITORY:-mongodb-dam-mock-endpoint}"
 mongodb_image_tag="${MONGODB_IMAGE_TAG:-}"
 secret_name="${SECRET_NAME:-mongodb-dam-secrets}"
+identity_mapping_secret="${DIRECT_USER_MAPPING_SECRET:-mongodb-dam-demo-direct-user}"
+identity_mapping_key="${DIRECT_USER_MAPPING_KEY:-identity-mapping.json}"
 values_file="${VALUES_FILE:-}"
 
 namespace_manifest="$(mktemp)"
@@ -112,6 +119,9 @@ if [[ "$demo_mode" == "true" ]]; then
     --set-string "demo.api.image.tag=$tag"
     --set-string "demo.receiver.image.repository=$demo_receiver_repository"
     --set-string "demo.receiver.image.tag=$tag"
+    --set "outpost.identityMapping.enabled=true"
+    --set-string "outpost.identityMapping.secretName=$identity_mapping_secret"
+    --set-string "outpost.identityMapping.key=$identity_mapping_key"
   )
 fi
 helm "${helm_args[@]}"

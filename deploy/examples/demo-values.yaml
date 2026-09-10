@@ -8,11 +8,12 @@ mongodb:
 
 observer:
   cpuProfileHz: 0
-  bulkDeleteThreshold: 10
 
 outpost:
   persistence:
     enabled: false
+  identityMapping:
+    enabled: true
 
 demo:
   enabled: true

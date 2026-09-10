@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use dam_schema::{DamBatch, KubernetesMetadata};
+use dam_schema::{DamBatch, EventPayload, ExternalIdentity, KubernetesMetadata};
 use dam_spool::DurableSpool;
 use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use reqwest::{redirect::Policy, Certificate, Client, Url};
@@ -41,6 +41,26 @@ pub struct OutpostConfig {
     pub kubernetes_token_path: PathBuf,
     pub kubernetes_ca_path: PathBuf,
     pub kubernetes_refresh_interval: Duration,
+    pub identity_mapping_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityMappingDocument {
+    schema_version: u16,
+    mappings: Vec<IdentityMappingEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityMappingEntry {
+    mongodb_principal_hash: String,
+    provider: String,
+    principal_type: String,
+    principal_arn: String,
+    account_id: String,
+    credential_source: String,
+    credential_resource: String,
 }
 
 #[derive(Clone)]
@@ -361,6 +381,18 @@ async fn accept_batch(State(state): State<AppState>, headers: HeaderMap, body: B
 }
 
 async fn enrich_batch(state: &AppState, batch: &mut DamBatch) {
+    let identities = match state.config.identity_mapping_file.as_deref() {
+        Some(path) => match load_identity_mappings(path) {
+            Ok(identities) => identities,
+            Err(error) => {
+                warn!(error = ?error, path = %path.display(), "failed to load external identity mapping; forwarding activity without external identity");
+                HashMap::new()
+            }
+        },
+        None => HashMap::new(),
+    };
+    enrich_external_identities(batch, &identities);
+
     let cache = state.kubernetes.read().await;
     for event in &mut batch.events {
         let existing = event.kubernetes.get_or_insert_with(Default::default);
@@ -379,6 +411,137 @@ async fn enrich_batch(state: &AppState, batch: &mut DamBatch) {
                 existing.container_name = container_name;
             }
         }
+    }
+}
+
+fn load_identity_mappings(path: &Path) -> Result<HashMap<String, ExternalIdentity>> {
+    let encoded = match fs::read(path) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading identity mapping {}", path.display()))
+        }
+    };
+    parse_identity_mappings(&encoded)
+        .with_context(|| format!("parsing identity mapping {}", path.display()))
+}
+
+fn parse_identity_mappings(encoded: &[u8]) -> Result<HashMap<String, ExternalIdentity>> {
+    let document: IdentityMappingDocument = serde_json::from_slice(encoded)?;
+    anyhow::ensure!(
+        document.schema_version == 1,
+        "unsupported identity mapping schema_version"
+    );
+    anyhow::ensure!(
+        document.mappings.len() <= 1_000,
+        "identity mapping exceeds 1000 entries"
+    );
+
+    let mut identities = HashMap::new();
+    for mapping in document.mappings {
+        validate_identity_mapping(&mapping)?;
+        let identity = ExternalIdentity {
+            provider: mapping.provider,
+            principal_type: mapping.principal_type,
+            principal_arn: mapping.principal_arn,
+            account_id: mapping.account_id,
+            credential_source: mapping.credential_source,
+            credential_resource: mapping.credential_resource,
+        };
+        anyhow::ensure!(
+            identities
+                .insert(mapping.mongodb_principal_hash, identity)
+                .is_none(),
+            "identity mapping contains a duplicate MongoDB principal hash"
+        );
+    }
+    Ok(identities)
+}
+
+fn validate_identity_mapping(mapping: &IdentityMappingEntry) -> Result<()> {
+    anyhow::ensure!(
+        mapping.mongodb_principal_hash.starts_with("sha256:")
+            && mapping.mongodb_principal_hash.len() == 71
+            && mapping.mongodb_principal_hash[7..]
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit()),
+        "MongoDB principal hash must be sha256 followed by 64 hexadecimal characters"
+    );
+    anyhow::ensure!(mapping.provider == "aws", "identity provider must be aws");
+    anyhow::ensure!(
+        matches!(mapping.principal_type.as_str(), "iam_user" | "iam_role"),
+        "principal_type must be iam_user or iam_role"
+    );
+    anyhow::ensure!(
+        mapping.account_id.len() == 12
+            && mapping
+                .account_id
+                .bytes()
+                .all(|value| value.is_ascii_digit()),
+        "AWS account_id must contain 12 digits"
+    );
+    anyhow::ensure!(
+        valid_iam_principal_arn(
+            &mapping.principal_arn,
+            &mapping.account_id,
+            &mapping.principal_type
+        ),
+        "principal_arn does not match account_id and principal_type"
+    );
+    anyhow::ensure!(
+        mapping.credential_source == "aws_secrets_manager",
+        "credential_source must be aws_secrets_manager"
+    );
+    anyhow::ensure!(
+        valid_secrets_manager_arn(&mapping.credential_resource, &mapping.account_id),
+        "credential_resource must be a Secrets Manager ARN in account_id"
+    );
+    Ok(())
+}
+
+fn valid_iam_principal_arn(value: &str, account_id: &str, principal_type: &str) -> bool {
+    let parts: Vec<_> = value.splitn(6, ':').collect();
+    let expected_resource = if principal_type == "iam_user" {
+        "user/"
+    } else {
+        "role/"
+    };
+    parts.len() == 6
+        && parts[0] == "arn"
+        && !parts[1].is_empty()
+        && parts[2] == "iam"
+        && parts[3].is_empty()
+        && parts[4] == account_id
+        && parts[5].starts_with(expected_resource)
+        && parts[5].len() > expected_resource.len()
+}
+
+fn valid_secrets_manager_arn(value: &str, account_id: &str) -> bool {
+    let parts: Vec<_> = value.splitn(6, ':').collect();
+    parts.len() == 6
+        && parts[0] == "arn"
+        && !parts[1].is_empty()
+        && parts[2] == "secretsmanager"
+        && !parts[3].is_empty()
+        && parts[4] == account_id
+        && parts[5].starts_with("secret:")
+        && parts[5].len() > "secret:".len()
+}
+
+fn enrich_external_identities(
+    batch: &mut DamBatch,
+    identities: &HashMap<String, ExternalIdentity>,
+) {
+    for event in &mut batch.events {
+        let principal = match &event.payload {
+            EventPayload::MongodbActivity(activity) if activity.principal_hashed => {
+                activity.principal.as_deref()
+            }
+            EventPayload::MongodbAuth(auth) if auth.principal_hashed => auth.principal.as_deref(),
+            _ => None,
+        };
+        event.identity = principal.and_then(|value| identities.get(value)).cloned();
     }
 }
 
@@ -606,6 +769,7 @@ mod tests {
             kubernetes_token_path: PathBuf::new(),
             kubernetes_ca_path: PathBuf::new(),
             kubernetes_refresh_interval: Duration::from_secs(60),
+            identity_mapping_file: None,
         };
         assert!(validate_config(&config).is_err());
 
@@ -613,5 +777,48 @@ mod tests {
         prefixed_mock.endpoint =
             "http://mock-endpoint.attacker.example/v1/ingest/mongodb-dam".into();
         assert!(validate_config(&prefixed_mock).is_err());
+    }
+
+    #[test]
+    fn validates_and_parses_identity_mapping() {
+        let encoded = br#"{
+          "schema_version": 1,
+          "mappings": [{
+            "mongodb_principal_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "provider": "aws",
+            "principal_type": "iam_user",
+            "principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice",
+            "account_id": "111122223333",
+            "credential_source": "aws_secrets_manager",
+            "credential_resource": "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam-demo-AbCdEf"
+          }]
+        }"#;
+        let identities = parse_identity_mappings(encoded).unwrap();
+        let identity = identities
+            .get("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .unwrap();
+        assert_eq!(identity.provider, "aws");
+        assert_eq!(identity.principal_type, "iam_user");
+        assert_eq!(
+            identity.principal_arn,
+            "arn:aws:iam::111122223333:user/dam-demo-alice"
+        );
+    }
+
+    #[test]
+    fn rejects_identity_mapping_with_mismatched_account() {
+        let encoded = br#"{
+          "schema_version": 1,
+          "mappings": [{
+            "mongodb_principal_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "provider": "aws",
+            "principal_type": "iam_user",
+            "principal_arn": "arn:aws:iam::999900001111:user/dam-demo-alice",
+            "account_id": "111122223333",
+            "credential_source": "aws_secrets_manager",
+            "credential_resource": "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam-demo-AbCdEf"
+          }]
+        }"#;
+        assert!(parse_identity_mappings(encoded).is_err());
     }
 }

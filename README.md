@@ -10,7 +10,7 @@ flowchart LR
         M[(MongoDB Community)]
         O[Observer DaemonSet<br/>eBPF + node-local sanitizer]
         Q[(Observer disk spool)]
-        P[Outpost Deployment<br/>validate + K8s enrich]
+        P[Outpost Deployment<br/>validate + K8s/identity enrich]
         S[(Outpost PVC spool)]
         M -->|syscalls, TCP, uprobes, scheduling| O
         O -->|metadata only| Q -->|authenticated HTTP| P --> S
@@ -21,13 +21,14 @@ flowchart LR
 ## What is implemented
 
 - MongoDB `OP_MSG`, legacy `OP_QUERY`/`OP_REPLY`, and `OP_COMPRESSED` decoding with bounded buffers, fragmentation handling, command/database/collection extraction, response status, and request/response duration correlation.
-- Per-connection SCRAM principal attribution, delete-one/delete-many scope extraction, affected-document counts, and a configurable critical `mongodb.bulk_delete` finding.
+- Per-connection SCRAM principal attribution plus delete-one/delete-many scope and affected-document metadata for downstream rule evaluation.
 - Plaintext socket interception at read/write syscalls and `SSL_read`/`SSL_write` uprobes for compatible OpenSSL/BoringSSL-backed `mongod`/`mongos` processes.
 - TCP connect/accept/close, handshake-established events (with duration when the start is observable), peer/active resets, zero-window signals, sampled smoothed RTT, retransmissions, and state-derived timeout signals.
 - Plaintext UDP DNS query/response metadata for MongoDB processes, including name, record type, response code, answer count, and correlated duration.
 - `pread`, `pwrite`, `fsync`, `fdatasync`, `openat`, slow page-fault, scheduler off-CPU, on-CPU stack, and `pthread_mutex_lock` wait telemetry.
 - MongoDB process exec/exit tracking, socket endpoint lookup, pod UID extraction from cgroups, and Outpost enrichment from the Kubernetes API.
 - A versioned metadata-only event contract, node-local and Outpost durable spools, assignment validation, internal authentication, regional token authentication, custom CA support, idempotency keys, health endpoints, and Prometheus metrics.
+- Optional demo-only Outpost enrichment that maps a salted MongoDB principal to an AWS IAM principal and the exact Secrets Manager credential ARN before HTTP push.
 - A generic mock endpoint for integration testing.
 
 The chart pins the official Community image to `mongo:8.0.29-noble`. Override it through `mongodb.image` when your patch-management process approves a newer Community release.
@@ -36,7 +37,7 @@ The chart pins the official Community image to `mongo:8.0.29-noble`. Override it
 
 The eBPF program copies at most 1 KiB from a MongoDB I/O operation into a node-local ring buffer so the Observer can identify BSON metadata. Userspace caps each large-frame prefix at 1 KiB even when it arrives through many short syscalls. Those transient bytes are never logged, serialized, spooled, or sent to Outpost. Only the fields defined in `dam-schema` can cross the node boundary; no attempt is made to retain or export the omitted body.
 
-Authentication principals are never emitted in clear text. Observer extracts a username from an explicit BSON `user` field or the SCRAM client-first payload when present, immediately hashes it with the customer-provided salt, and discards the clear value. Passwords, proofs, nonces, and complete authentication payloads are never serialized or exported.
+MongoDB authentication principals are never emitted in clear text. Observer extracts a username from an explicit BSON `user` field or the SCRAM client-first payload when present, immediately hashes it with the customer-provided salt, and discards the clear value. In the opt-in IAM demo, Outpost can join that salted hash to a protected customer mapping and export the corresponding IAM ARN, AWS account ID, and Secrets Manager secret ARN as actor metadata. Passwords, AWS credentials, proofs, nonces, and complete authentication payloads are never serialized or exported.
 
 ## Prerequisites
 
@@ -66,6 +67,7 @@ Run the full Rust/eBPF build-time suite and the disposable Outpost contract test
 ```bash
 make test-container
 make test-http-push
+make test-secret-access
 ```
 
 On a Linux Docker host that permits privileged containers, run the live probe-to-MongoDB test with `make test-ebpf`. Override `MONGODB_TEST_IMAGE` when the host kernel is incompatible with the chart's pinned MongoDB 8 image.
@@ -199,37 +201,37 @@ It should show `find`, `insert`, `update`, `aggregate`, and `delete`, without qu
 
 The implementation is in [run-demo.sh](scripts/run-demo.sh), and the demo Kubernetes components are in [demo.yaml](deploy/helm/mongodb-dam/templates/demo.yaml).
 
-Validation passed: 29 Rust tests, strict Clippy, Helm lint/render, demo API integration, Bearer-protected receiver readback, Outpost delivery/quarantine tests, and a privileged live eBPF test covering SCRAM attribution, a 35-document finding, role revocation/session kill, the subsequent denied query, and clear-value redaction. The live test uses MongoDB Community 7 on hosts whose kernel cannot run MongoDB 8; the chart remains pinned to Community 8 for supported cluster kernels.
+Validation passed: 31 Rust tests, strict Clippy, Helm lint/render, demo API integration, mocked Secrets Manager denial verification, Bearer-protected Outpost delivery/quarantine with trusted IAM enrichment, and a privileged live eBPF test covering SCRAM attribution, a captured 35-document bulk delete, IAM enrichment, TCP lifecycle telemetry, and clear-value redaction. The live test uses MongoDB Community 7 on hosts whose kernel cannot run MongoDB 8; the chart remains pinned to Community 8 for supported cluster kernels.
 
-## Exact AWS IAM user → direct MongoDB bulk-delete → flag → block demo
+## Exact AWS IAM user → direct MongoDB activity capture demo
 
-This is the end-to-end DAM storyline for the MVP. It does not call the demo REST API for the destructive action. A `mongosh` client connects directly to MongoDB, authenticates as a dedicated database user, executes `deleteMany`, and is attributed by Observer.
+This is the end-to-end capture storyline for the MVP. It does not call the demo REST API for the destructive action. A `mongosh` client connects directly to MongoDB, authenticates as a dedicated database user, executes `deleteMany`, and produces an attributed activity event that Observer sends through Outpost. This repository does not decide whether that activity is malicious; Collect and Sentinel will do that after HTTP push is integrated.
 
 ### Read this identity boundary first
 
 MongoDB Community does **not** support native `MONGODB-AWS` authentication; [MongoDB documents that mechanism as Atlas-only](https://www.mongodb.com/docs/drivers/rust/current/security/authentication/aws-iam/). Community supports SCRAM authentication, as described in MongoDB's [security checklist](https://www.mongodb.com/docs/manual/administration/security-checklist/). Atlas database nodes cannot run this Observer because customers do not control those hosts. This demo therefore uses the following combination:
 
 ```text
-AWS IAM user/role
+AWS IAM user
     └── authorized by AWS to read one Secrets Manager secret
           └── secret maps IAM ARN to one MongoDB SCRAM user
                 └── mongosh connects directly to MongoDB
                       └── Observer hashes the SCRAM username and attributes commands
+                            └── Outpost joins the protected IAM mapping and HTTP-pushes metadata
 ```
 
-AWS IAM is the gate for obtaining the database credential; MongoDB Community performs SCRAM-SHA-256 authentication. The clear IAM ARN is stored in a protected, demo-only identity mapping. It is joined to the salted principal hash only when the finding is displayed. Passwords, delete filters, and document bodies are not exported.
+AWS IAM is the gate for obtaining the database credential; MongoDB Community performs SCRAM-SHA-256 authentication. The clear IAM ARN and Secrets Manager ARN are stored in a protected, demo-only Kubernetes Secret mounted only into Outpost. Outpost performs the trusted join and exports those identifiers as metadata. Passwords, AWS credentials, delete filters, and document bodies are not exported.
 
-The rule fires after MongoDB returns the result because only then is the affected-document count known. In the MongoDB wire command, [`limit: 0` identifies a multi-delete and response field `n` reports the deleted count](https://www.mongodb.com/docs/manual/reference/command/delete/). The block step [revokes the user's role](https://www.mongodb.com/docs/v7.0/reference/command/revokerolesfromuser/) and [kills its sessions](https://www.mongodb.com/docs/v8.0/reference/command/killallsessions/), which contains subsequent access. It cannot undo or prevent the first delete. Inline prevention would require a database proxy or another synchronous enforcement point; that is outside this eBPF-only MVP.
+In the MongoDB wire command, [`limit: 0` identifies a multi-delete and response field `n` reports the deleted count](https://www.mongodb.com/docs/manual/reference/command/delete/). Observer correlates those request and response facts on the authenticated connection, then Outpost validates, enriches, and delivers the event. Neither component assigns a severity, emits a finding, evaluates a rule, or blocks a user. Those responsibilities belong to Sentinel downstream of Collect.
 
 ### What this flow demonstrates
 
 - AWS authorizes a named IAM principal to retrieve exactly one demo database credential.
 - That identity uses `mongosh` directly; the destructive query does not pass through the REST API.
 - Observer correlates the SCRAM exchange to the same physical MongoDB connection.
-- The exported `mongodb_activity` contains the salted principal hash, `delete_scope=multi`, and `affected_documents=35`.
-- Observer emits a critical `security_finding` with rule ID `mongodb.bulk_delete` when the configured threshold is reached.
-- An operator invokes a local containment action that runs `revokeRolesFromUser` and `killAllSessions`.
-- A final direct query proves that MongoDB now returns an authorization error for the same credential.
+- The exported `mongodb_activity` contains the IAM user ARN, AWS account ID, credential-secret ARN, salted MongoDB principal hash, `delete_scope=multi`, and `affected_documents=35`.
+- Outpost receives that activity, replaces any untrusted incoming identity with its protected mapping, adds available Kubernetes metadata, and delivers it to the exact configured HTTP endpoint.
+- A later Collect/Sentinel pipeline can match rules against the activity without putting detection logic in the customer cluster.
 
 ### Prerequisites for this flow
 
@@ -237,16 +239,16 @@ Use the separate customer/demo AWS account and cluster, not the Foundry/current 
 
 - the demo deployment from this repository, with its in-memory receiver enabled;
 - an AWS administrator profile that can manage one Secrets Manager secret;
-- an existing same-account IAM user or role for the simulated database user;
+- an existing same-account IAM user for the simulated database user;
 - a second AWS CLI profile that actually assumes/uses that IAM identity;
 - `aws`, `docker`, `kubectl`, `jq`, `openssl`, `sha256sum`, and `base64` on a Linux client;
 - the local secret environment produced by `scripts/generate-secrets.sh`.
 
-The direct-client scripts use Docker host networking. Run them on Linux. AWS documents how a [resource-based policy can grant one role access to one secret](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_resource-policies.html) and that [an explicit deny overrides an allow](https://docs.aws.amazon.com/secretsmanager/latest/userguide/determine-acccess_examine-iam-policies.html). Therefore, if an Organizations SCP, permissions boundary, or another policy explicitly denies `secretsmanager:GetSecretValue`, the resource policy created by the provisioner cannot override it.
+The direct-client scripts use Docker host networking. Run them on Linux. AWS documents how a [resource-based policy can grant a principal access to one secret](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_resource-policies.html) and that [an explicit deny overrides an allow](https://docs.aws.amazon.com/secretsmanager/latest/userguide/determine-acccess_examine-iam-policies.html). Therefore, if an Organizations SCP, permissions boundary, or another policy explicitly denies `secretsmanager:GetSecretValue`, the resource policy created by the provisioner cannot override it.
 
 ### Step 0 — build and deploy demo mode in the other account
 
-Skip this step only if the current demo images, including these bulk-delete changes, are already deployed.
+Skip this step only if the current demo images, including the direct-user capture changes, are already deployed.
 
 From the repository root in the administrator terminal:
 
@@ -280,7 +282,7 @@ export DEMO_RECEIVER_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-mock-endpoint"
 ./scripts/smoke-test.sh
 ```
 
-The deployment refuses to proceed unless the active context exactly equals `EXPECTED_KUBE_CONTEXT`. The default alert threshold is 10 affected documents. To change it, set `observer.bulkDeleteThreshold` in the values file and redeploy.
+The deployment refuses to proceed unless the active context exactly equals `EXPECTED_KUBE_CONTEXT`.
 
 Confirm the rollout:
 
@@ -322,7 +324,7 @@ The destructive-user scenario targets only `dam_demo.customer_records` documents
 
 ### Step 2 — choose the IAM identity and provision its direct database user
 
-In administrator terminal 2, select your administrator AWS profile and the existing IAM user or role that will act as the database user:
+In administrator terminal 2, select your administrator AWS profile and the existing IAM user that will act as the database user:
 
 ```bash
 export AWS_PROFILE=dam-admin
@@ -331,11 +333,7 @@ export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output te
 export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
 export DEMO_AWS_SECRET_ID=mongodb-dam/demo/direct-user
 
-# IAM user example:
 export DEMO_IAM_PRINCIPAL_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:user/dam-demo-alice"
-
-# Or use a role ARN instead:
-# export DEMO_IAM_PRINCIPAL_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/dam-demo-mongodb-user"
 
 ./scripts/provision-direct-user.sh
 ```
@@ -347,7 +345,8 @@ The provisioner:
 3. creates or rotates that SCRAM user with only `readWrite@dam_demo`;
 4. writes the generated password to AWS Secrets Manager without printing it;
 5. puts a Secrets Manager resource policy granting only the chosen IAM principal `GetSecretValue`;
-6. stores the IAM ARN ↔ salted MongoDB-principal-hash mapping in the demo namespace.
+6. stores the IAM ARN, AWS account, secret ARN, and salted MongoDB-principal-hash mapping in the demo namespace;
+7. restarts Outpost so its next accepted batch is deterministically enriched with that mapping.
 
 Expected summary resembles:
 
@@ -360,13 +359,13 @@ AWS secret ARN:      arn:aws:secretsmanager:ap-south-1:111122223333:secret:...
 The password was written only to AWS Secrets Manager and was not printed.
 ```
 
-Verify that the second CLI profile really represents the selected identity. For a role, STS returns an `assumed-role` session ARN; the client script normalizes it back to the IAM role ARN before comparing it with the mapping.
+Verify that the second CLI profile really represents the selected IAM user:
 
 ```bash
 AWS_PROFILE=dam-user aws sts get-caller-identity
 ```
 
-Do not continue unless this is the intended demo user/role. If `GetSecretValue` is denied despite the secret resource policy, check that identity's permissions boundary and your Organizations SCPs for an explicit deny.
+Do not continue unless this is the intended demo user. If `GetSecretValue` is denied despite the secret resource policy, check that identity's permissions boundary and your Organizations SCPs for an explicit deny.
 
 ### Step 3 — open the direct MongoDB tunnel as the presenter
 
@@ -381,11 +380,13 @@ This keeps MongoDB private; it does not expose a public LoadBalancer. The next c
 
 ### Step 4 — run the bulk delete as the IAM-mapped user
 
-Open the simulated user's terminal. Select the user/role profile, verify it, and run:
+Open the simulated user's terminal. Select the user profile, verify it, and run:
 
 ```bash
 export AWS_PROFILE=dam-user
 export AWS_REGION=ap-south-1
+export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+export DEMO_IAM_PRINCIPAL_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:user/dam-demo-alice"
 export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
 export DEMO_AWS_SECRET_ID=mongodb-dam/demo/direct-user
 export USE_EXISTING_MONGODB_FORWARD=true
@@ -417,9 +418,9 @@ Expected result:
 
 The password exists transiently in the disposable container environment and is removed with that container. This handling is suitable for demoware, not production credential delivery.
 
-The script also writes a non-secret start-time marker to `/tmp/mongodb-dam-direct-user-last-run-$UID`. The viewer uses it to avoid displaying a stale finding from an earlier presentation. If the user and presenter terminals are on different machines, copy the printed epoch value and set `DIRECT_USER_NOT_BEFORE_EPOCH=<value>` before step 5.
+The script also writes a non-secret start-time marker to `/tmp/mongodb-dam-direct-user-last-run-$UID`. The viewer uses it to avoid displaying stale activity from an earlier presentation. If the user and presenter terminals are on different machines, copy the printed epoch value and set `DIRECT_USER_NOT_BEFORE_EPOCH=<value>` before step 5.
 
-### Step 5 — display the attributed critical DAM finding
+### Step 5 — display the attributed activity delivered by Outpost
 
 Back in administrator terminal 2, keep `BEARER_TOKEN` loaded from `deploy/examples/secrets.local.env`, then run:
 
@@ -429,116 +430,120 @@ set -a
 source deploy/examples/secrets.local.env
 set +a
 
-./scripts/show-bulk-delete-finding.sh
+./scripts/show-direct-user-activity.sh
 ```
 
-The command waits for Observer → Outpost → receiver delivery and prints the newest finding for the mapped principal. Expected shape:
+The command waits for Observer → Outpost → configured demo receiver delivery and prints the newest matching `mongodb_activity`. Expected shape:
 
 ```json
 {
-  "severity": "critical",
-  "rule_id": "mongodb.bulk_delete",
-  "title": "Bulk MongoDB delete completed",
+  "observed_at": "2026-09-09T12:00:00Z",
   "iam_principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice",
+  "aws_account_id": "111122223333",
+  "credential_source": "aws_secrets_manager",
+  "credential_secret_arn": "arn:aws:secretsmanager:ap-south-1:111122223333:secret:...",
   "mongodb_principal_hash": "sha256:...",
+  "command": "delete",
   "database": "dam_demo",
   "collection": "customer_records",
   "delete_scope": "multi",
+  "delete_statements": 1,
   "affected_documents": 35,
-  "threshold_documents": 10,
-  "action": "flagged; containment required"
+  "succeeded": true,
+  "error_code": null,
+  "error_name": null,
+  "duration_us": 1234,
+  "request_bytes": 156,
+  "response_bytes": 45,
+  "connection_id": "1234:17",
+  "remote": {"address": "10.0.1.25", "port": 41862},
+  "capture_source": "cleartext_syscall",
+  "pod": "mongodb-dam-mongodb-0",
+  "node": "ip-10-0-1-10"
 }
 ```
 
-The clear IAM ARN shown here is a local join from the protected identity mapping. Outpost receives only the salted principal hash. The underlying `mongodb_activity` also includes request/response duration, response success, socket identity, process, pod, node, and capture source.
+This output is the proof: the command came from the direct MongoDB user, Observer attributed it to the salted SCRAM principal, Outpost joined the protected IAM mapping and delivered it, and no query predicate or document body crossed the boundary. The IAM and secret ARNs shown here are inside the exported event so Collect can persist the actor and Rover can display and target the correct demo identity.
 
-### Step 6 — block the user
+The bundled receiver stands in for the configured regional ingress during this demo. Once the regional path exists, the same event flows through Collect and Sentinel can match a rule such as “successful multi-delete affecting at least 10 documents.” No rule, severity, finding, or blocking action is produced in this customer-side repository.
 
-In administrator terminal 2:
+### Step 6 — Rover revokes future credential retrieval
 
-```bash
-export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
-./scripts/block-direct-user.sh
-```
-
-This operator-triggered MVP response runs the equivalent of:
-
-```javascript
-db.getSiblingDB("admin").revokeRolesFromUser(
-  "<mapped-mongodb-user>",
-  [{role: "readWrite", db: "dam_demo"}]
-)
-db.getSiblingDB("admin").runCommand({
-  killAllSessions: [{user: "<mapped-mongodb-user>", db: "admin"}]
-})
-```
-
-Expected summary:
+This action belongs in Rover, not this repository. The intended demo request is:
 
 ```text
-Contained IAM principal arn:aws:iam::111122223333:user/dam-demo-alice by revoking MongoDB role readWrite@dam_demo and killing its sessions.
-This blocks subsequent database operations; it does not undo the initial delete.
+Rover UI
+  -> Rover backend using temporary customer global-admin AWS credentials
+  -> iam:PutUserPolicy on dam-demo-alice
+  -> explicit Deny secretsmanager:GetSecretValue on the one exported secret ARN
 ```
 
-The IAM principal can still retrieve the secret after this step, which makes the proof stronger: the cached/returned credential remains valid for SCRAM authentication, but MongoDB no longer authorizes data access.
+There is deliberately no customer-side revoke HTTP endpoint and no IAM policy mutation script in `mongodb-dam`. Once the Rover action reports success, continue in the simulated user's terminal.
 
-### Step 7 — prove the same user is blocked
+### Step 7 — verify the IAM user was denied
 
-In the simulated user's terminal, with the same exports from step 4:
+Keep the user-profile exports from step 4 and run:
 
 ```bash
-./scripts/verify-direct-user-blocked.sh
+./scripts/verify-direct-user-secret-revoked.sh
 ```
 
-The script retrieves the same secret and attempts a direct `find` on `dam_demo.customer_records`. It succeeds only when `mongosh` fails with MongoDB's authorization error. Expected prefix:
+Expected result:
 
-```text
-PASS: MongoDB rejected the mapped user query after containment for arn:aws:iam::111122223333:user/dam-demo-alice.
+```json
+{
+  "status": "verified",
+  "iam_principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice",
+  "aws_secret_id": "mongodb-dam/demo/direct-user",
+  "secret_access": "denied"
+}
 ```
 
-The failed operation is also useful DAM evidence: after delivery it appears as a principal-attributed activity with `succeeded=false` and an authorization error code/name.
+The verifier requests only the secret ARN from AWS CLI output, never the secret value. It succeeds only for the expected IAM caller and an `AccessDenied` result; a reachable secret or unrelated AWS failure makes the verification fail. Running `direct-user-bulk-delete.sh` again now also stops at `GetSecretValue` before opening a new MongoDB connection.
+
+This proves that Rover blocked new retrieval through the managed demo path. IAM cannot erase a password that was already copied or terminate an already-open MongoDB session. The demo intentionally uses a fresh Secrets Manager lookup and a disposable `mongosh` container for every operation.
 
 ### Step 8 — reset and repeat the presentation
 
-Run the seed call again to recreate all 35 records:
-
-```bash
-curl --fail --silent --show-error \
-  --request POST http://127.0.0.1:8080/demo/seed | jq .
-```
-
-Then run the provisioner again as `dam-admin`. It rotates the password, restores `readWrite@dam_demo`, marks the mapping active, and updates the same AWS secret:
+First use Rover to remove its demo inline deny policy. Then, in the administrator terminal, run the provisioner again to rotate the MongoDB password, refresh the secret and mapping, and restart Outpost:
 
 ```bash
 export AWS_PROFILE=dam-admin
 ./scripts/provision-direct-user.sh
 ```
 
-Repeat steps 4 through 7.
+Run the seed call again to recreate all 35 disposable records:
+
+```bash
+curl --fail --silent --show-error \
+  --request POST http://127.0.0.1:8080/demo/seed | jq .
+```
+
+Repeat steps 4 through 7. Resetting Rover's deny is intentionally not automated here because AWS response ownership belongs to Rover.
 
 ### DAM dashboard views supported by this telemetry
 
-The regional UI can build these MVP panels from the emitted events:
+After Collect persists the activity and Sentinel evaluates rules, the regional UI can build these MVP panels:
 
-- a critical finding queue grouped by severity, rule, customer, cluster, database, and collection;
-- a direct database-user timeline keyed by salted principal, with an authorized identity-registry join to IAM ARN;
-- bulk-delete cards showing scope, affected count, threshold, success, duration, connection, pod, and node;
-- top destructive principals and collections over time;
+- a live database activity stream by customer, cluster, database, collection, command, success, pod, and node;
+- a direct database-user timeline keyed by the exported IAM ARN and salted MongoDB principal;
+- delete activity cards showing single/multi scope, statement count, affected count, duration, connection, pod, and node;
+- top active principals, databases, collections, and commands over time;
 - command volume, error rate, latency percentiles, and slow-operation views by command/database/collection;
 - authentication success/failure and user-management command timelines;
 - connection churn, resets, retransmits, smoothed RTT, zero-window, and timeout views;
 - host I/O latency, page-fault, off-CPU, on-CPU, and lock-wait correlations;
-- a containment case view showing the finding, role revocation command, session kill, and the subsequent denied query.
+- Sentinel findings and cases joined back to the exact immutable source activity that caused each rule match.
 
-The bundled receiver is only an event viewer; it is not yet that dashboard. Durable regional storage, identity-registry ingestion, alert state, case management, and the Collect HTTP-push command/response path are the next-cell work.
+The bundled receiver is only an event viewer; it is not yet that dashboard. Durable regional storage, identity governance, Sentinel rules, alert state, case management, and the Collect HTTP-push path are the next-cell work.
 
 ### Known MVP gaps in this exact storyline
 
 - This is AWS-IAM-gated credential retrieval plus MongoDB SCRAM, not native MongoDB IAM authentication.
-- Flagging is post-operation. eBPF observation cannot synchronously stop the first delete.
-- Containment is invoked by the local operator script. Automatic regional-to-customer enforcement waits for the authenticated command path that will be built with Collect.
-- The IAM mapping remains demo-local. A real regional product needs a secure identity registry and audited mapping lifecycle.
-- The script supports a same-account IAM principal. Cross-account Secrets Manager access needs a customer-managed KMS key and additional key/resource policies.
+- Observer and Outpost intentionally perform capture and transport only. Detection and response wait for Collect/Sentinel integration.
+- The opt-in demo exports clear IAM and Secrets Manager ARNs. A production design needs a secure identity registry, explicit data-governance approval, and an audited mapping lifecycle.
+- The provisioner supports a same-account IAM principal. Cross-account Secrets Manager access needs a customer-managed KMS key and additional key/resource policies.
 - `mongosh` runs in a short-lived Docker container and uses a presenter-owned Kubernetes port-forward. This avoids exposing MongoDB publicly but is not a production access architecture.
-- Attribution is connection-scoped. A capture gap during SCRAM, unsupported TLS library, undecodable compression, or a command whose metadata falls beyond the bounded prefix can produce activity without a principal or finding.
-- Revoking the MongoDB role and killing sessions blocks later authorized operations; it is not data recovery. Backups or point-in-time recovery are separate controls.
+- Attribution is connection-scoped. A capture gap during SCRAM, unsupported TLS library, undecodable compression, or command metadata beyond the bounded prefix can produce activity without a principal.
+- An asynchronous eBPF sensor observes completed operations; inline prevention would require a separate synchronous enforcement point.
+- IAM denial blocks future Secrets Manager retrieval, not a previously copied password or already-open MongoDB session. The disposable demo client makes a new secret request for each operation.

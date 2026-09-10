@@ -134,5 +134,5 @@ docker run --rm --network host \
   '
 
 unset mongo_password
-printf 'Finding correlation marker: %s (epoch %s)\n' "$run_marker_file" "$run_started_epoch"
-printf '%s\n' 'The initial delete has completed. Run show-bulk-delete-finding.sh, then block-direct-user.sh.'
+printf 'Activity correlation marker: %s (epoch %s)\n' "$run_marker_file" "$run_started_epoch"
+printf '%s\n' 'The delete has completed. Run show-direct-user-activity.sh to display the activity delivered by Outpost.'

@@ -33,6 +33,55 @@
         "parse_errors": 0,
         "spool_bytes": 0
       }
+    },
+    {
+      "schema_version": 1,
+      "event_id": "integration-event-0002",
+      "observed_at": "2026-01-01T00:00:01Z",
+      "monotonic_timestamp_ns": 2,
+      "customer_id": "integration-customer",
+      "tenant_id": "integration-tenant",
+      "source_id": "integration-source",
+      "regional_cell_id": "integration-cell",
+      "capture": {
+        "sensor_id": "integration-sensor",
+        "node_name": "integration-node",
+        "source": "cleartext_syscall",
+        "confidence": "complete",
+        "metadata_only": true,
+        "truncated": false
+      },
+      "identity": {
+        "provider": "aws",
+        "principal_type": "iam_user",
+        "principal_arn": "arn:aws:iam::999900001111:user/untrusted-input",
+        "account_id": "999900001111",
+        "credential_source": "aws_secrets_manager",
+        "credential_resource": "arn:aws:secretsmanager:ap-south-1:999900001111:secret:untrusted-input"
+      },
+      "event_type": "mongodb_activity",
+      "details": {
+        "command": "delete",
+        "database": "dam_demo",
+        "collection": "customer_records",
+        "principal": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "principal_hashed": true,
+        "delete_scope": "multi",
+        "delete_statements": 1,
+        "affected_documents": 35,
+        "request_id": 42,
+        "response_id": 43,
+        "request_bytes": 128,
+        "response_bytes": 32,
+        "duration_us": 1000,
+        "succeeded": true,
+        "expects_response": true,
+        "compressed": false,
+        "connection": {
+          "connection_id": "1234:7",
+          "fd": 7
+        }
+      }
     }
   ]
 }

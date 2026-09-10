@@ -80,8 +80,21 @@ pub struct DamEvent {
     pub kubernetes: Option<KubernetesMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ExternalIdentity>,
     #[serde(flatten)]
     pub payload: EventPayload,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIdentity {
+    pub provider: String,
+    pub principal_type: String,
+    pub principal_arn: String,
+    pub account_id: String,
+    pub credential_source: String,
+    pub credential_resource: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -158,7 +171,6 @@ pub enum EventPayload {
     MongodbActivity(MongodbActivity),
     MongodbConnection(MongodbConnection),
     MongodbAuth(MongodbAuth),
-    SecurityFinding(SecurityFinding),
     DnsActivity(DnsActivity),
     HostIo(HostIo),
     Profile(ProfileSample),
@@ -254,29 +266,6 @@ pub struct MongodbAuth {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct SecurityFinding {
-    pub rule_id: String,
-    pub severity: String,
-    pub title: String,
-    pub action: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal: Option<String>,
-    pub principal_hashed: bool,
-    pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub database: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collection: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delete_scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub affected_documents: Option<u64>,
-    pub threshold_documents: u64,
-    pub connection_id: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct DnsActivity {
     pub operation: String,
     pub transport: String,
@@ -366,6 +355,15 @@ mod tests {
             },
             kubernetes: None,
             process: None,
+            identity: Some(ExternalIdentity {
+                provider: "aws".into(),
+                principal_type: "iam_user".into(),
+                principal_arn: "arn:aws:iam::111122223333:user/dam-demo-alice".into(),
+                account_id: "111122223333".into(),
+                credential_source: "aws_secrets_manager".into(),
+                credential_resource:
+                    "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam-demo".into(),
+            }),
             payload: EventPayload::MongodbActivity(MongodbActivity {
                 command: "find".into(),
                 database: Some("sales".into()),
@@ -398,6 +396,8 @@ mod tests {
         assert!(!json.contains("document"));
         assert!(!json.contains("raw_body"));
         assert!(json.contains("mongodb_activity"));
+        assert!(json.contains("dam-demo-alice"));
+        assert!(json.contains("aws_secrets_manager"));
     }
 
     #[test]
@@ -421,6 +421,7 @@ mod tests {
             },
             kubernetes: None,
             process: None,
+            identity: None,
             payload: EventPayload::SensorHealth(SensorHealth {
                 status: "ok".into(),
                 component: "observer".into(),

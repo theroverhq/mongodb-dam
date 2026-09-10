@@ -39,6 +39,10 @@ Do not silently use `auto` for a compliance policy that requires command visibil
 
 Update the `bearer-token` key in the configured Kubernetes Secret, then restart the Outpost Deployment so it reads the new value. The endpoint is posted exactly as configured and redirects are not followed. A private endpoint CA may be supplied through `destination.caSecretName`.
 
+## Demo identity mapping
+
+`outpost.identityMapping` is disabled by default and enabled automatically by `scripts/deploy.sh` only when `DEMO_MODE=true`. The direct-user provisioner writes a metadata-only mapping Secret and restarts Outpost after each change. Do not place MongoDB passwords or AWS access keys in that mapping. Outside demoware, keep this feature disabled until identity export, governance, and mapping rotation have a production design.
+
 ## Upgrades
 
 1. Build immutable image tags and scan them in the customer account's registry.

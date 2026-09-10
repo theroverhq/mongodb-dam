@@ -6,7 +6,7 @@ This mode is disposable presentation infrastructure. It adds:
 - the normal node-local Observer and Outpost pipeline;
 - an in-memory HTTP receiver that accepts Outpost batches and exposes them for inspection.
 
-MongoDB Community does not provide a general-purpose REST query API. The bundled demo API is the application layer that a client machine calls. Observer captures the resulting MongoDB wire-protocol activity at `mongod`; Outpost validates, enriches, spools, and forwards the sanitized metadata to the demo receiver.
+MongoDB Community does not provide a general-purpose REST query API. The bundled demo API is the application layer that a client machine calls. Observer captures the resulting MongoDB wire-protocol activity at `mongod`; Outpost validates, enriches, spools, and forwards the sanitized metadata to the demo receiver. The separate direct-user flow can additionally mount a protected demo mapping so Outpost exports the IAM user and Secrets Manager ARN associated with a salted MongoDB principal.
 
 ## Deploy demo mode
 
@@ -74,7 +74,7 @@ Expected summary:
 
 The dummy values use the reserved `.test` domain and are not real customer data.
 
-For the AWS IAM-mapped direct `mongosh` attack, critical finding, containment, and denied-query proof, follow the complete final section of the repository [README](../README.md#exact-aws-iam-user--direct-mongodb-bulk-delete--flag--block-demo).
+For the AWS IAM-mapped direct `mongosh` scenario and proof that its attributed bulk-delete activity reached the Outpost destination, follow the complete final section of the repository [README](../README.md#exact-aws-iam-user--direct-mongodb-activity-capture-demo).
 
 ## 2. Execute queries over HTTP from the client machine
 
@@ -120,7 +120,7 @@ The API intentionally exposes fixed demo operations instead of accepting arbitra
 
 ## 3. See what Observer captured and Outpost delivered
 
-Observer is the capture component. Outpost receives those batches, adds Kubernetes metadata, durably spools them, and pushes them to the configured endpoint.
+Observer is the capture component. Outpost receives those batches, adds Kubernetes metadata and any explicitly configured demo identity mapping, durably spools them, and pushes them to the configured endpoint.
 
 Keep a receiver port-forward running in terminal 3:
 

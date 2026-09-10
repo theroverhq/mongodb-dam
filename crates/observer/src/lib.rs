@@ -1,8 +1,7 @@
 use dam_schema::{
     CaptureConfidence, CaptureMetadata, CaptureSource, ConnectionMetadata, DamEvent, DnsActivity,
     EventPayload, HostIo, KubernetesMetadata, MongodbActivity, MongodbAuth, MongodbConnection,
-    NetworkEndpoint, ProcessLifecycle, ProcessMetadata, ProfileSample, SecurityFinding,
-    EVENT_SCHEMA_VERSION,
+    NetworkEndpoint, ProcessLifecycle, ProcessMetadata, ProfileSample, EVENT_SCHEMA_VERSION,
 };
 use mongo_protocol::{DecodedMessage, DecoderConfig, DeleteScope, MongoCommand, StreamDecoder};
 use sha2::{Digest, Sha256};
@@ -112,7 +111,6 @@ pub struct ProcessorConfig {
     pub max_message_bytes: usize,
     pub cpu_profile_hz: u32,
     pub principal_hash_salt: Option<String>,
-    pub bulk_delete_threshold: u64,
 }
 
 #[derive(Clone)]
@@ -436,33 +434,6 @@ impl EventProcessor {
             }),
         )];
 
-        if succeeded == Some(true)
-            && affected_documents.is_some_and(|count| count >= self.config.bulk_delete_threshold)
-            && matches!(
-                request.command.delete_scope,
-                Some(DeleteScope::Multi | DeleteScope::Mixed)
-            )
-        {
-            result.push(self.event_from_seed(
-                request.seed.clone(),
-                EventPayload::SecurityFinding(SecurityFinding {
-                    rule_id: "mongodb.bulk_delete".into(),
-                    severity: "critical".into(),
-                    title: "Bulk MongoDB delete completed".into(),
-                    action: "flagged; containment required".into(),
-                    principal: request.actor_principal_hash.clone(),
-                    principal_hashed: request.actor_principal_hash.is_some(),
-                    command: request.command.name.clone(),
-                    database: request.command.database.clone(),
-                    collection: request.command.collection.clone(),
-                    delete_scope: delete_scope.map(str::to_string),
-                    affected_documents,
-                    threshold_documents: self.config.bulk_delete_threshold,
-                    connection_id: request.connection.connection_id.clone(),
-                }),
-            ));
-        }
-
         if is_auth_command(&request.command.name) || request.command.speculative_auth {
             let default_mechanism = if is_user_management_command(&request.command.name) {
                 "user_management"
@@ -715,6 +686,7 @@ impl EventProcessor {
             capture: seed.capture,
             kubernetes: seed.kubernetes,
             process: seed.process,
+            identity: None,
             payload,
         }
     }
@@ -1137,7 +1109,6 @@ mod tests {
             max_message_bytes: 1024 * 1024,
             cpu_profile_hz: 0,
             principal_hash_salt: Some("customer-salt".into()),
-            bulk_delete_threshold: 10,
         })
     }
 
@@ -1252,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn attributes_bulk_delete_to_scram_principal_and_emits_finding() {
+    fn attributes_bulk_delete_to_scram_principal_and_exports_metadata() {
         let mut processor = test_processor();
         let speculative_hello = MongoCommand {
             name: "hello".into(),
@@ -1311,7 +1282,7 @@ mod tests {
             response_message(15, 14, Some(35), None),
         );
 
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         let expected_principal = hash_principal("customer-salt", "alice");
         let activity = events.iter().find_map(|event| match &event.payload {
             EventPayload::MongodbActivity(activity) => Some(activity),
@@ -1324,19 +1295,6 @@ mod tests {
         );
         assert_eq!(activity.delete_scope.as_deref(), Some("multi"));
         assert_eq!(activity.affected_documents, Some(35));
-
-        let finding = events.iter().find_map(|event| match &event.payload {
-            EventPayload::SecurityFinding(finding) => Some(finding),
-            _ => None,
-        });
-        let finding = finding.expect("bulk-delete security finding");
-        assert_eq!(finding.rule_id, "mongodb.bulk_delete");
-        assert_eq!(
-            finding.principal.as_deref(),
-            Some(expected_principal.as_str())
-        );
-        assert_eq!(finding.affected_documents, Some(35));
-        assert_eq!(finding.threshold_documents, 10);
     }
 
     #[test]

@@ -9,7 +9,8 @@
 - TCP lifecycle coverage now includes handshake-established events and duration when a start transition is observable, peer versus active reset direction, zero-window signals, and state-derived `ETIMEDOUT` events in addition to connect, accept, close, retransmit, and sampled SRTT.
 - TLS discovery now checks both OpenSSL and BoringSSL mappings and falls back to exported `SSL_*` symbols in the MongoDB executable for compatible static linking.
 - SCRAM identities, including modern speculative authentication in `hello`, are correlated to later commands on the same physical connection as salted hashes.
-- Delete command arrays and OP_MSG document sequences are classified as single, multi, or mixed; response counts can produce the node-local `mongodb.bulk_delete` finding.
+- Delete command arrays and OP_MSG document sequences are classified as single, multi, or mixed; response counts are exported as activity metadata for downstream Sentinel rules.
+- In demo mode, Outpost can replace untrusted incoming identity with a protected salted-principal mapping and export the corresponding AWS IAM/account/Secrets Manager identifiers.
 
 ## Remaining capture boundaries
 
@@ -45,12 +46,14 @@
 - The file spools do not implement application-level encryption. Use encrypted Kubernetes volumes and encrypted node disks, and enable Kubernetes Secret encryption at rest in the customer account.
 - Outpost reads its destination bearer token at startup. Rotate the Kubernetes Secret together with an Outpost rollout; in-flight and already-spooled batches keep their stable idempotency keys.
 - Kubernetes pod labels are enrichment metadata and can cross the endpoint boundary. Do not place secrets in labels; a deployment needing stricter minimization should remove or allow-list labels before production qualification.
+- The direct-user identity mapping deliberately exports clear IAM and Secrets Manager ARNs in demo mode. It contains no password or AWS key, but production use still requires identity-governance review, authorization, rotation, and audit controls.
 
 ## Product gaps for the next phase
 
 - Command does not yet model `http_push` or `mongodb_dam` sources.
 - The configured regional endpoint does not yet provide the production credential assignment, durable idempotency store, or downstream mapping into Collect. That integration is deliberately outside this customer-side repository and is the next phase.
-- Regional querying, configurable rule management beyond the built-in bulk-delete demo rule, retention, RBAC, audit evidence, dashboards, symbol storage, and flamegraph construction remain to be built.
-- The direct-user demo maps an AWS IAM ARN to a MongoDB Community SCRAM credential through Secrets Manager. It is not native `MONGODB-AWS`, its clear identity join remains demo-local, and containment is operator-triggered after the destructive operation.
+- Regional querying, Sentinel rule evaluation, retention, RBAC, audit evidence, dashboards, symbol storage, and flamegraph construction remain to be built.
+- The direct-user demo maps an AWS IAM ARN to a MongoDB Community SCRAM credential through Secrets Manager. It is not native `MONGODB-AWS`. Outpost exports the demo IAM and secret identifiers, but customer-side components do not decide whether activity is malicious or mutate IAM access.
+- Rover's demo IAM deny blocks future Secrets Manager retrieval only. It cannot invalidate a copied SCRAM password or terminate an already-open MongoDB session; the disposable client performs a fresh secret lookup for each operation.
 - There is no operator-managed MongoDB topology here. The bundled Community database is one standalone StatefulSet for product validation, not a production replica set, backup, restore, or upgrade solution.
 - Generic HTTP/1.1, HTTP/2, gRPC, AI-service signature matching, and vector-database protocol classification are not part of this MongoDB DAM sensor. Adding them would be a separate source type with separate privacy and protocol contracts.

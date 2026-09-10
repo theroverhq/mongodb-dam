@@ -42,6 +42,7 @@ docker run --detach --rm \
   --tmpfs /var/lib/mongodb-dam/outpost:rw,uid=65532,gid=65532,size=67108864 \
   --mount "type=bind,src=$repo_root/tests/fixtures/bearer-token.txt,dst=/run/secrets/bearer-token,readonly" \
   --mount "type=bind,src=$repo_root/tests/fixtures/internal-token.txt,dst=/run/secrets/internal-token,readonly" \
+  --mount "type=bind,src=$repo_root/tests/fixtures/identity-mapping.json,dst=/run/identity/identity-mapping.json,readonly" \
   -e DAM_CUSTOMER_ID=integration-customer \
   -e DAM_TENANT_ID=integration-tenant \
   -e DAM_SOURCE_ID=integration-source \
@@ -50,6 +51,7 @@ docker run --detach --rm \
   -e OUTPOST_INTERNAL_TOKEN_FILE=/run/secrets/internal-token \
   -e OUTPOST_ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam \
   -e OUTPOST_BEARER_TOKEN_FILE=/run/secrets/bearer-token \
+  -e OUTPOST_IDENTITY_MAPPING_FILE=/run/identity/identity-mapping.json \
   -e OUTPOST_EXPORT_INTERVAL_SECONDS=1 \
   mongodb-dam-outpost:dev >/dev/null
 
@@ -87,7 +89,23 @@ fi
 received="$(curl --fail --silent \
   --header 'authorization: Bearer integration-bearer-token' \
   "http://127.0.0.1:$mock_port/v1/batches?limit=10")"
-jq -e '.count == 1 and .batches[0].batch_id == "integration-batch-0001"' \
+jq -e '
+  .count == 1
+  and .batches[0].batch_id == "integration-batch-0001"
+  and ([.batches[0].events[]
+    | select(.event_id == "integration-event-0001")
+    | has("identity")] == [false])
+  and ([.batches[0].events[]
+    | select(.event_id == "integration-event-0002")
+    | .identity] == [{
+      provider: "aws",
+      principal_type: "iam_user",
+      principal_arn: "arn:aws:iam::111122223333:user/dam-demo-alice",
+      account_id: "111122223333",
+      credential_source: "aws_secrets_manager",
+      credential_resource: "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam-demo-AbCdEf"
+    }])
+' \
   <<<"$received" >/dev/null
 if curl --fail --silent "http://127.0.0.1:$mock_port/v1/batches" >/dev/null 2>&1; then
   printf '%s\n' 'Mock endpoint exposed batches without bearer authentication.' >&2

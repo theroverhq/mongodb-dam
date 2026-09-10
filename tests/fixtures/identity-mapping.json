@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "mappings": [
+    {
+      "mongodb_principal_hash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "provider": "aws",
+      "principal_type": "iam_user",
+      "principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice",
+      "account_id": "111122223333",
+      "credential_source": "aws_secrets_manager",
+      "credential_resource": "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam-demo-AbCdEf"
+    }
+  ]
+}

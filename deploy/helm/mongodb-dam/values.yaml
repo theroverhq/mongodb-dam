@@ -60,9 +60,6 @@ mongodb:
 
 observer:
   mongodbPort: 27017
-  # Emit a critical mongodb.bulk_delete finding when a multi-delete affects
-  # at least this many documents.
-  bulkDeleteThreshold: 10
   cpuProfileHz: 49
   tlsUprobes: auto
   lockProfiling: true
@@ -88,6 +85,12 @@ outpost:
   replicas: 1
   spoolMaxBytes: 1073741824
   maxRequestBytes: 5242880
+  identityMapping:
+    # Demo-only trusted mapping used to attach an AWS IAM actor to a salted
+    # MongoDB principal before HTTP push. Keep disabled unless explicitly used.
+    enabled: false
+    secretName: mongodb-dam-demo-direct-user
+    key: identity-mapping.json
   persistence:
     enabled: true
     size: 10Gi

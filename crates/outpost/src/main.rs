@@ -57,6 +57,8 @@ struct Cli {
     kubernetes_ca_path: PathBuf,
     #[arg(long, env = "OUTPOST_KUBERNETES_REFRESH_SECONDS", default_value_t = 30)]
     kubernetes_refresh_seconds: u64,
+    #[arg(long, env = "OUTPOST_IDENTITY_MAPPING_FILE")]
+    identity_mapping_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -95,6 +97,7 @@ async fn main() -> Result<()> {
         kubernetes_token_path: cli.kubernetes_token_path,
         kubernetes_ca_path: cli.kubernetes_ca_path,
         kubernetes_refresh_interval: Duration::from_secs(cli.kubernetes_refresh_seconds.max(5)),
+        identity_mapping_file: cli.identity_mapping_file,
     })?;
     spawn_background_tasks(state.clone());
     let listener = TcpListener::bind(cli.listen_addr)

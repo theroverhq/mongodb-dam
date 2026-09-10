@@ -1,4 +1,4 @@
-.PHONY: check test test-container test-http-push test-ebpf test-demo-api build-images lint-chart render-chart
+.PHONY: check test test-container test-http-push test-ebpf test-demo-api test-secret-access build-images lint-chart render-chart
 
 check:
 	cargo check --workspace --locked
@@ -17,6 +17,9 @@ test-ebpf:
 
 test-demo-api:
 	./scripts/test-demo-api.sh
+
+test-secret-access:
+	./scripts/test-direct-user-secret-access.sh
 
 build-images:
 	./scripts/build-images.sh

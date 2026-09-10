@@ -14,15 +14,32 @@ Headers:
 - `authorization: Bearer <source credential>`
 - `idempotency-key: <batch_id>`
 
-Body: one `DamBatch` from `crates/schema`, with `schema_version: 1`. Identity fields are repeated on the batch and every event so the regional ingress can reject cross-customer or cross-source injection before persistence or forwarding.
+Body: one `DamBatch` from `crates/schema`, with `schema_version: 1`. Assignment fields are repeated on the batch and every event so the regional ingress can reject cross-customer or cross-source injection before persistence or forwarding.
 
-MongoDB activity may include an optional salted `principal`, `delete_scope`, `delete_statements`, and `affected_documents`. A node-local `mongodb.bulk_delete` rule emits a `security_finding` event with the same hashed principal, target namespace, affected count, configured threshold, severity, and connection ID. Clear usernames, IAM ARNs, query predicates, and document bodies are not part of the HTTP-push contract; any IAM display name must come from a separately authorized identity registry.
+MongoDB activity may include an optional salted `principal`, `delete_scope`, `delete_statements`, and `affected_documents`. These are capture facts, not customer-side findings: Outpost forwards them so Collect can make them available to Sentinel for downstream rule evaluation. Clear MongoDB usernames, query predicates, document bodies, secret values, and AWS credentials are never part of the HTTP-push contract.
+
+The opt-in direct-user demo can add this root-level identity metadata to a MongoDB activity/auth event whose salted principal matches the protected Outpost mapping:
+
+```json
+{
+  "identity": {
+    "provider": "aws",
+    "principal_type": "iam_user",
+    "principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice",
+    "account_id": "111122223333",
+    "credential_source": "aws_secrets_manager",
+    "credential_resource": "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam-demo-AbCdEf"
+  }
+}
+```
+
+Outpost never trusts an `identity` supplied by Observer input: it clears unmatched identity and replaces matched identity from its read-only mapping file. This clear IAM/secret-ARN export is explicitly demoware. Production identity governance and mapping lifecycle belong in the regional product design.
 
 ## Required receiver behavior
 
 1. Authenticate the source credential and resolve it to exactly one customer, tenant, source, and regional cell assignment.
 2. Enforce a compressed and uncompressed request-size limit. Outpost defaults to 5 MiB per Observer-to-Outpost batch.
-3. Parse with unknown-field rejection and validate every repeated identity against the credential assignment.
+3. Parse with unknown-field rejection and validate every repeated customer/tenant/source/cell assignment against the source credential.
 4. Use `(source_id, batch_id)` as the idempotency key before producing downstream records.
 5. Return `202 Accepted` only after the regional durability boundary is crossed. Internal forwarding to Collect or another service happens behind this endpoint.
 6. Return `409 Conflict` for an already accepted idempotency key; Outpost treats that as acknowledged.

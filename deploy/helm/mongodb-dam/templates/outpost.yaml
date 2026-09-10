@@ -1,6 +1,9 @@
 {{- if ne (int .Values.outpost.replicas) 1 }}
 {{- fail "outpost.replicas must be 1 because the durable file spool is single-writer" }}
 {{- end }}
+{{- if and .Values.outpost.identityMapping.enabled (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.outpost.identityMapping.key)) }}
+{{- fail "outpost.identityMapping.key must be a single Kubernetes Secret data key" }}
+{{- end }}
 {{- if .Values.outpost.persistence.enabled }}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -79,6 +82,10 @@ spec:
               value: {{ int64 .Values.outpost.spoolMaxBytes | quote }}
             - name: OUTPOST_MAX_REQUEST_BYTES
               value: {{ int64 .Values.outpost.maxRequestBytes | quote }}
+            {{- if .Values.outpost.identityMapping.enabled }}
+            - name: OUTPOST_IDENTITY_MAPPING_FILE
+              value: {{ printf "/var/run/mongodb-dam/identity/%s" .Values.outpost.identityMapping.key | quote }}
+            {{- end }}
             - name: KUBERNETES_SERVICE_HOST
               value: kubernetes.default.svc
             - name: KUBERNETES_SERVICE_PORT_HTTPS
@@ -112,6 +119,11 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.outpost.identityMapping.enabled }}
+            - name: identity-mapping
+              mountPath: /var/run/mongodb-dam/identity
+              readOnly: true
+            {{- end }}
             {{- if .Values.destination.caSecretName }}
             - name: destination-ca
               mountPath: /var/run/mongodb-dam/destination-ca
@@ -135,6 +147,15 @@ spec:
                 path: bearer-token
         - name: tmp
           emptyDir: {}
+        {{- if .Values.outpost.identityMapping.enabled }}
+        - name: identity-mapping
+          secret:
+            secretName: {{ required "outpost.identityMapping.secretName is required when identity mapping is enabled" .Values.outpost.identityMapping.secretName | quote }}
+            optional: true
+            items:
+              - key: {{ required "outpost.identityMapping.key is required when identity mapping is enabled" .Values.outpost.identityMapping.key | quote }}
+                path: {{ .Values.outpost.identityMapping.key | quote }}
+        {{- end }}
         {{- if .Values.destination.caSecretName }}
         - name: destination-ca
           secret:
