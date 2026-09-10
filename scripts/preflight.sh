@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=load-env.sh
+source "$repo_root/scripts/load-env.sh"
+
 for command_name in kubectl helm docker; do
   command -v "$command_name" >/dev/null || {
     printf 'Missing required command: %s\n' "$command_name" >&2
@@ -15,7 +19,6 @@ if [[ "$current_context" != "$expected_context" ]]; then
   exit 1
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 helm lint "$repo_root/deploy/helm/mongodb-dam" >/dev/null
 kubectl auth can-i create daemonsets.apps --all-namespaces | grep -qx yes || {
   printf '%s\n' 'Current identity cannot create DaemonSets.' >&2

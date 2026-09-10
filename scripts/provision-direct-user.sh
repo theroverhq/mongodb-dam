@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=load-env.sh
+source "$repo_root/scripts/load-env.sh"
+
 for command_name in aws base64 jq kubectl mktemp openssl sha256sum; do
   command -v "$command_name" >/dev/null || {
     printf 'Missing required command: %s\n' "$command_name" >&2

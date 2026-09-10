@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-output="${1:-$repo_root/deploy/examples/secrets.local.env}"
+template="$repo_root/.env.example"
+output="${1:-$repo_root/.env}"
 
 if [[ -e "$output" ]]; then
   printf 'Refusing to overwrite existing secret file: %s\n' "$output" >&2
@@ -16,14 +17,27 @@ bearer_token="$(openssl rand -hex 32)"
 principal_salt="$(openssl rand -hex 32)"
 mongodb_password="$(openssl rand -base64 32 | tr -d '\n')"
 
-{
-  printf 'OBSERVER_INTERNAL_TOKEN=%q\n' "$observer_token"
-  printf 'BEARER_TOKEN=%q\n' "$bearer_token"
-  printf 'PRINCIPAL_HASH_SALT=%q\n' "$principal_salt"
-  printf 'MONGODB_ROOT_USERNAME=%q\n' 'dam-admin'
-  printf 'MONGODB_ROOT_PASSWORD=%q\n' "$mongodb_password"
-} > "$output"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in
+    OBSERVER_INTERNAL_TOKEN=*)
+      printf 'OBSERVER_INTERNAL_TOKEN=%q\n' "$observer_token"
+      ;;
+    BEARER_TOKEN=*)
+      printf 'BEARER_TOKEN=%q\n' "$bearer_token"
+      ;;
+    PRINCIPAL_HASH_SALT=*)
+      printf 'PRINCIPAL_HASH_SALT=%q\n' "$principal_salt"
+      ;;
+    MONGODB_ROOT_PASSWORD=*)
+      printf 'MONGODB_ROOT_PASSWORD=%q\n' "$mongodb_password"
+      ;;
+    *)
+      printf '%s\n' "$line"
+      ;;
+  esac
+done < "$template" > "$output"
 
 chmod 600 "$output"
-printf 'Wrote local secret environment file (mode 0600): %s\n' "$output"
-printf '%s\n' 'For a regional deployment, provision the generated BEARER_TOKEN at the configured endpoint. Demo mode configures its bundled receiver automatically.'
+printf 'Wrote complete local environment file (mode 0600): %s\n' "$output"
+printf '%s\n' 'Fill the blank target-account, registry, S3, and IAM-principal values before deploying.'
+printf '%s\n' 'Local entry-point scripts load this file automatically; no source/export step is required.'

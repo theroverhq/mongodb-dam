@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=load-env.sh
+source "$repo_root/scripts/load-env.sh"
+
 for command_name in aws date docker jq kubectl mktemp; do
   command -v "$command_name" >/dev/null || {
     printf 'Missing required command: %s\n' "$command_name" >&2
@@ -43,9 +47,45 @@ if [[ "$use_existing_forward" != true && "$use_existing_forward" != false ]]; th
   exit 1
 fi
 
-caller_arn="$(aws --region "$AWS_REGION" sts get-caller-identity --query Arn --output text)"
+direct_user_aws=(aws)
+if [[ -n "${DIRECT_USER_AWS_ACCESS_KEY_ID:-}" \
+  || -n "${DIRECT_USER_AWS_SECRET_ACCESS_KEY:-}" ]]; then
+  : "${DIRECT_USER_AWS_ACCESS_KEY_ID:?Set DIRECT_USER_AWS_ACCESS_KEY_ID with its matching secret key}"
+  : "${DIRECT_USER_AWS_SECRET_ACCESS_KEY:?Set DIRECT_USER_AWS_SECRET_ACCESS_KEY with its matching access key}"
+  direct_user_aws=(
+    env
+    -u AWS_ACCESS_KEY_ID
+    -u AWS_SECRET_ACCESS_KEY
+    -u AWS_SESSION_TOKEN
+    -u AWS_PROFILE
+    -u AWS_DEFAULT_PROFILE
+    "AWS_ACCESS_KEY_ID=$DIRECT_USER_AWS_ACCESS_KEY_ID"
+    "AWS_SECRET_ACCESS_KEY=$DIRECT_USER_AWS_SECRET_ACCESS_KEY"
+  )
+  if [[ -n "${DIRECT_USER_AWS_SESSION_TOKEN:-}" ]]; then
+    direct_user_aws+=("AWS_SESSION_TOKEN=$DIRECT_USER_AWS_SESSION_TOKEN")
+  fi
+  direct_user_aws+=(aws)
+elif [[ -n "${DIRECT_USER_AWS_SESSION_TOKEN:-}" ]]; then
+  printf '%s\n' 'DIRECT_USER_AWS_SESSION_TOKEN requires matching direct-user access and secret keys.' >&2
+  exit 1
+elif [[ -n "${DIRECT_USER_AWS_PROFILE:-}" ]]; then
+  # Do not let administrator credentials in the parent environment override
+  # the explicitly selected simulated-user profile.
+  direct_user_aws=(
+    env
+    -u AWS_ACCESS_KEY_ID
+    -u AWS_SECRET_ACCESS_KEY
+    -u AWS_SESSION_TOKEN
+    -u AWS_DEFAULT_PROFILE
+    aws --profile "$DIRECT_USER_AWS_PROFILE"
+  )
+fi
+
+caller_arn="$("${direct_user_aws[@]}" --region "$AWS_REGION" \
+  sts get-caller-identity --query Arn --output text)"
 caller_principal="$(canonical_iam_arn "$caller_arn")"
-credential="$(aws --region "$AWS_REGION" secretsmanager get-secret-value \
+credential="$("${direct_user_aws[@]}" --region "$AWS_REGION" secretsmanager get-secret-value \
   --secret-id "$aws_secret_id" --query SecretString --output text)"
 
 stored_principal="$(jq -er '.iam_principal_arn' <<<"$credential")"

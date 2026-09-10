@@ -1,0 +1,24 @@
+# Disposable DAM presentation mode with S3 as the Outpost destination.
+# scripts/deploy.sh replaces the bucket, prefix, and region from environment.
+destination:
+  mode: s3
+  s3:
+    bucket: replace-from-OUTPOST_S3_BUCKET
+    prefix: replace-from-OUTPOST_S3_PREFIX
+    region: replace-from-AWS_REGION
+
+mongodb:
+  persistence:
+    enabled: false
+
+observer:
+  cpuProfileHz: 0
+
+outpost:
+  persistence:
+    enabled: false
+  identityMapping:
+    enabled: true
+
+demo:
+  enabled: true

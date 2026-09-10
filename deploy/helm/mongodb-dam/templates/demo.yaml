@@ -98,6 +98,7 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+{{- if eq (lower .Values.destination.mode) "http" }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -178,4 +179,5 @@ spec:
     - name: http
       port: 8088
       targetPort: http
+{{- end }}
 {{- end }}

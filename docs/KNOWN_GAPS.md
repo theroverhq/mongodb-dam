@@ -2,7 +2,7 @@
 
 ## Gaps closed in this revision
 
-- Destination coupling was removed. Outpost now accepts one opaque endpoint and one bearer token; no Collect route, header, or credential model is assumed.
+- Destination coupling was removed. Outpost now exports directly to a configured S3 bucket/prefix as gzip NDJSON; the optional HTTP mode accepts one opaque endpoint and bearer token.
 - Bounded legacy `OP_QUERY`/`OP_REPLY` parsing now complements `OP_MSG` and compressed-wrapper decoding.
 - SCRAM client-first usernames are extracted only long enough to produce a salted hash. The clear username and the remainder of the SCRAM exchange never enter an event.
 - Plaintext UDP DNS queries and responses from MongoDB processes now produce metadata-only events with correlation latency.
@@ -37,21 +37,21 @@
 - Observer currently targets every process named exactly `mongod` or `mongos` visible on its node. That is appropriate for a dedicated customer database cluster; a shared cluster needs a control-plane-supplied pod/cgroup allow-list before this can provide per-source isolation.
 - MongoDB 8 currently refuses to start on Linux kernels 6.19 through 7.0.13 because of an [upstream TCMalloc incompatibility documented by MongoDB](https://www.mongodb.com/docs/manual/release-notes/8.0/#mongodb-is-incompatible-with-linux-kernel-6.19-through-7.0.13). Preflight blocks that combination; use a supported node kernel.
 - Privileged DaemonSets, host PID, tracefs, and BTF are hard requirements. Restricted managed/serverless nodes cannot run it.
-- The Outpost file spool is single-writer, so the Helm chart intentionally requires one replica. Its PVC survives pod restarts, but customer-cluster high availability requires a shared durable queue or partitioned spool design. Regional high availability begins after the configured endpoint durably accepts a batch.
-- Kubernetes NetworkPolicy cannot safely allow an HTTPS FQDN by itself. Enforce the regional hostname/private endpoint using the cloud firewall, egress gateway, or CNI FQDN policy in the customer account.
+- The Outpost file spool is single-writer, so the Helm chart intentionally requires one replica. Its PVC survives pod restarts, but customer-cluster high availability requires a shared durable queue or partitioned spool design. The destination durability boundary begins after S3 acknowledges `PutObject` (or the HTTP receiver accepts a batch in compatibility mode).
+- Kubernetes NetworkPolicy cannot safely allow an HTTPS FQDN by itself. Enforce the S3 endpoint or optional HTTP hostname using the cloud firewall, egress gateway, VPC endpoint policy, or CNI FQDN policy in the customer account.
 
 ## Deployment and security boundaries
 
 - Observer-to-Outpost traffic is bearer-authenticated but uses cluster-internal HTTP. Run the components in a dedicated namespace and apply CNI isolation; environments that require encryption for all east-west traffic need a service-mesh or mTLS termination layer.
 - The file spools do not implement application-level encryption. Use encrypted Kubernetes volumes and encrypted node disks, and enable Kubernetes Secret encryption at rest in the customer account.
-- Outpost reads its destination bearer token at startup. Rotate the Kubernetes Secret together with an Outpost rollout; in-flight and already-spooled batches keep their stable idempotency keys.
+- Outpost reads static AWS credentials or the optional HTTP bearer token at startup. Rotate the Kubernetes Secret together with an Outpost rollout; in-flight and already-spooled batches keep their stable deterministic object keys/batch IDs.
 - Kubernetes pod labels are enrichment metadata and can cross the endpoint boundary. Do not place secrets in labels; a deployment needing stricter minimization should remove or allow-list labels before production qualification.
 - The direct-user identity mapping deliberately exports clear IAM and Secrets Manager ARNs in demo mode. It contains no password or AWS key, but production use still requires identity-governance review, authorization, rotation, and audit controls.
 
 ## Product gaps for the next phase
 
-- Command does not yet model `http_push` or `mongodb_dam` sources.
-- The configured regional endpoint does not yet provide the production credential assignment, durable idempotency store, or downstream mapping into Collect. That integration is deliberately outside this customer-side repository and is the next phase.
+- Command/Collect does not yet model the S3-backed `mongodb_dam` source or consume this prefix.
+- The S3 bucket handoff does not yet provide a regional consumer checkpoint, downstream mapping into Collect, lifecycle policy, or dead-letter workflow. That integration is deliberately outside this customer-side repository and is the next phase.
 - Regional querying, Sentinel rule evaluation, retention, RBAC, audit evidence, dashboards, symbol storage, and flamegraph construction remain to be built.
 - The direct-user demo maps an AWS IAM ARN to a MongoDB Community SCRAM credential through Secrets Manager. It is not native `MONGODB-AWS`. Outpost exports the demo IAM and secret identifiers, but customer-side components do not decide whether activity is malicious or mutate IAM access.
 - Rover's demo IAM deny blocks future Secrets Manager retrieval only. It cannot invalidate a copied SCRAM password or terminate an already-open MongoDB session; the disposable client performs a fresh secret lookup for each operation.

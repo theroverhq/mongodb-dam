@@ -29,10 +29,26 @@ images:
     pullPolicy: IfNotPresent
 
 destination:
-  # Opaque HTTPS ingress endpoint in the regional cell. It need not be Collect.
+  # "s3" writes gzip-compressed NDJSON objects. "http" remains available for
+  # the bundled local receiver and the legacy regional HTTP-push contract.
+  mode: http
   endpoint: https://regional-ingress.invalid/v1/ingest/mongodb-dam
   caSecretName: ""
   caSecretKey: destination-ca.pem
+  s3:
+    bucket: ""
+    prefix: ""
+    # Passed as AWS_REGION. The SDK gets credentials from its standard chain.
+    region: ""
+    # Demo/testing only; leave empty for AWS S3.
+    endpointUrl: ""
+    forcePathStyle: false
+    # Optional Secret containing standard AWS credential values. Leave empty
+    # to use EKS Pod Identity, IRSA, the node role, or another SDK provider.
+    credentialsSecretName: ""
+    accessKeyIdKey: aws-access-key-id
+    secretAccessKeyKey: aws-secret-access-key
+    sessionTokenKey: aws-session-token
 
 mongodb:
   enabled: true
@@ -87,7 +103,7 @@ outpost:
   maxRequestBytes: 5242880
   identityMapping:
     # Demo-only trusted mapping used to attach an AWS IAM actor to a salted
-    # MongoDB principal before HTTP push. Keep disabled unless explicitly used.
+    # MongoDB principal before export. Keep disabled unless explicitly used.
     enabled: false
     secretName: mongodb-dam-demo-direct-user
     key: identity-mapping.json

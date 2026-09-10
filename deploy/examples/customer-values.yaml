@@ -16,9 +16,14 @@ images:
     pullPolicy: IfNotPresent
 
 destination:
-  endpoint: https://ingress.cell-ap-south-1.example.com/v1/ingest/mongodb-dam
-  # For a private CA, create the named Secret in the customer cluster.
-  caSecretName: ""
+  mode: s3
+  s3:
+    bucket: replace-with-dam-demo-bucket
+    prefix: mongodb-dam/events
+    region: ap-south-1
+    # scripts/deploy.sh fills this automatically when OUTPOST_AWS_* static
+    # credentials are present in .env. Leave empty for EKS-native providers.
+    credentialsSecretName: ""
 
 mongodb:
   persistence:

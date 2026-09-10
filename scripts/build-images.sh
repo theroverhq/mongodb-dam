@@ -2,6 +2,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=load-env.sh
+source "$repo_root/scripts/load-env.sh"
+
 tag="${TAG:-dev}"
 registry="${REGISTRY:-}"
 push_images="${PUSH_IMAGES:-false}"

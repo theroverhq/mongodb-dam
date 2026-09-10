@@ -1,6 +1,22 @@
 {{- if ne (int .Values.outpost.replicas) 1 }}
 {{- fail "outpost.replicas must be 1 because the durable file spool is single-writer" }}
 {{- end }}
+{{- $destinationMode := lower .Values.destination.mode }}
+{{- if not (has $destinationMode (list "http" "s3")) }}
+{{- fail "destination.mode must be http or s3" }}
+{{- end }}
+{{- if and (eq $destinationMode "http") (empty .Values.destination.endpoint) }}
+{{- fail "destination.endpoint is required when destination.mode=http" }}
+{{- end }}
+{{- if and (eq $destinationMode "s3") (empty .Values.destination.s3.bucket) }}
+{{- fail "destination.s3.bucket is required when destination.mode=s3" }}
+{{- end }}
+{{- if and (eq $destinationMode "s3") (empty .Values.destination.s3.prefix) }}
+{{- fail "destination.s3.prefix is required when destination.mode=s3" }}
+{{- end }}
+{{- if and (eq $destinationMode "s3") (empty .Values.destination.s3.region) }}
+{{- fail "destination.s3.region is required when destination.mode=s3" }}
+{{- end }}
 {{- if and .Values.outpost.identityMapping.enabled (not (regexMatch "^[A-Za-z0-9._-]+$" .Values.outpost.identityMapping.key)) }}
 {{- fail "outpost.identityMapping.key must be a single Kubernetes Secret data key" }}
 {{- end }}
@@ -74,10 +90,45 @@ spec:
               value: {{ required "assignment.clusterName is required" .Values.assignment.clusterName | quote }}
             - name: OUTPOST_INTERNAL_TOKEN_FILE
               value: /var/run/mongodb-dam/secrets/observer-internal-token
+            - name: OUTPOST_DESTINATION
+              value: {{ $destinationMode | quote }}
+            {{- if eq $destinationMode "http" }}
             - name: OUTPOST_ENDPOINT
-              value: {{ required "destination.endpoint is required" .Values.destination.endpoint | quote }}
+              value: {{ .Values.destination.endpoint | quote }}
             - name: OUTPOST_BEARER_TOKEN_FILE
               value: /var/run/mongodb-dam/secrets/bearer-token
+            {{- else }}
+            - name: OUTPOST_S3_BUCKET
+              value: {{ .Values.destination.s3.bucket | quote }}
+            - name: OUTPOST_S3_PREFIX
+              value: {{ .Values.destination.s3.prefix | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.destination.s3.region | quote }}
+            {{- if .Values.destination.s3.endpointUrl }}
+            - name: OUTPOST_S3_ENDPOINT_URL
+              value: {{ .Values.destination.s3.endpointUrl | quote }}
+            {{- end }}
+            - name: OUTPOST_S3_FORCE_PATH_STYLE
+              value: {{ .Values.destination.s3.forcePathStyle | quote }}
+            {{- with .Values.destination.s3.credentialsSecretName }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.destination.s3.accessKeyIdKey | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.destination.s3.secretAccessKeyKey | quote }}
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.destination.s3.sessionTokenKey | quote }}
+                  optional: true
+            {{- end }}
+            {{- end }}
             - name: OUTPOST_SPOOL_MAX_BYTES
               value: {{ int64 .Values.outpost.spoolMaxBytes | quote }}
             - name: OUTPOST_MAX_REQUEST_BYTES
@@ -90,7 +141,7 @@ spec:
               value: kubernetes.default.svc
             - name: KUBERNETES_SERVICE_PORT_HTTPS
               value: "443"
-            {{- if .Values.destination.caSecretName }}
+            {{- if and (eq $destinationMode "http") .Values.destination.caSecretName }}
             - name: OUTPOST_CA_FILE
               value: /var/run/mongodb-dam/destination-ca/{{ .Values.destination.caSecretKey }}
             {{- end }}
@@ -124,7 +175,7 @@ spec:
               mountPath: /var/run/mongodb-dam/identity
               readOnly: true
             {{- end }}
-            {{- if .Values.destination.caSecretName }}
+            {{- if and (eq $destinationMode "http") .Values.destination.caSecretName }}
             - name: destination-ca
               mountPath: /var/run/mongodb-dam/destination-ca
               readOnly: true
@@ -143,8 +194,10 @@ spec:
             items:
               - key: observer-internal-token
                 path: observer-internal-token
+              {{- if eq $destinationMode "http" }}
               - key: bearer-token
                 path: bearer-token
+              {{- end }}
         - name: tmp
           emptyDir: {}
         {{- if .Values.outpost.identityMapping.enabled }}
@@ -156,7 +209,7 @@ spec:
               - key: {{ required "outpost.identityMapping.key is required when identity mapping is enabled" .Values.outpost.identityMapping.key | quote }}
                 path: {{ .Values.outpost.identityMapping.key | quote }}
         {{- end }}
-        {{- if .Values.destination.caSecretName }}
+        {{- if and (eq $destinationMode "http") .Values.destination.caSecretName }}
         - name: destination-ca
           secret:
             secretName: {{ .Values.destination.caSecretName }}

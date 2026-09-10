@@ -49,6 +49,7 @@ docker run --detach --rm \
   -e DAM_REGIONAL_CELL_ID=integration-cell \
   -e DAM_CLUSTER_NAME=integration-cluster \
   -e OUTPOST_INTERNAL_TOKEN_FILE=/run/secrets/internal-token \
+  -e OUTPOST_DESTINATION=http \
   -e OUTPOST_ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam \
   -e OUTPOST_BEARER_TOKEN_FILE=/run/secrets/bearer-token \
   -e OUTPOST_IDENTITY_MAPPING_FILE=/run/identity/identity-mapping.json \

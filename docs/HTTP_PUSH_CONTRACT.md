@@ -1,4 +1,6 @@
-# Regional endpoint HTTP-push contract
+# Optional regional endpoint HTTP-push contract
+
+S3 gzip-NDJSON is now the deployment path for the DAM demo; see [S3_EXPORT_CONTRACT.md](S3_EXPORT_CONTRACT.md). This HTTP exporter remains supported for the bundled in-cluster receiver and compatibility testing.
 
 Outpost treats the destination as an opaque regional ingress endpoint. It does not address Collect directly and has no dependency on the eventual regional routing implementation. The current Foundry, Command, Collect, and connector-catalog repositories have not been modified.
 

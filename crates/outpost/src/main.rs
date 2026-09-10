@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
-use clap::Parser;
-use outpost::{build_state, read_secret, router, spawn_background_tasks, OutpostConfig};
+use clap::{Parser, ValueEnum};
+use outpost::{
+    build_state, read_secret, router, spawn_background_tasks, DestinationConfig,
+    HttpDestinationConfig, OutpostConfig, S3DestinationConfig,
+};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -23,12 +26,22 @@ struct Cli {
     cluster_name: String,
     #[arg(long, env = "OUTPOST_INTERNAL_TOKEN_FILE")]
     internal_token_file: Option<PathBuf>,
+    #[arg(long, env = "OUTPOST_DESTINATION")]
+    destination: Option<DestinationKind>,
     #[arg(long, env = "OUTPOST_ENDPOINT")]
-    endpoint: String,
+    endpoint: Option<String>,
     #[arg(long, env = "OUTPOST_BEARER_TOKEN_FILE")]
-    bearer_token_file: PathBuf,
+    bearer_token_file: Option<PathBuf>,
     #[arg(long, env = "OUTPOST_CA_FILE")]
     ca_file: Option<PathBuf>,
+    #[arg(long, env = "OUTPOST_S3_BUCKET")]
+    s3_bucket: Option<String>,
+    #[arg(long, env = "OUTPOST_S3_PREFIX")]
+    s3_prefix: Option<String>,
+    #[arg(long, env = "OUTPOST_S3_ENDPOINT_URL")]
+    s3_endpoint_url: Option<String>,
+    #[arg(long, env = "OUTPOST_S3_FORCE_PATH_STYLE", default_value_t = false)]
+    s3_force_path_style: bool,
     #[arg(
         long,
         env = "OUTPOST_SPOOL_DIR",
@@ -61,6 +74,12 @@ struct Cli {
     identity_mapping_file: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DestinationKind {
+    Http,
+    S3,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -70,7 +89,39 @@ async fn main() -> Result<()> {
         .json()
         .init();
     let cli = Cli::parse();
-    let bearer_token = read_secret(&cli.bearer_token_file)?;
+    let destination_kind = cli.destination.unwrap_or_else(|| {
+        if cli.s3_bucket.is_some() || cli.s3_prefix.is_some() {
+            DestinationKind::S3
+        } else {
+            DestinationKind::Http
+        }
+    });
+    let destination = match destination_kind {
+        DestinationKind::Http => {
+            let endpoint = cli
+                .endpoint
+                .context("OUTPOST_ENDPOINT is required for the HTTP destination")?;
+            let token_file = cli
+                .bearer_token_file
+                .as_deref()
+                .context("OUTPOST_BEARER_TOKEN_FILE is required for the HTTP destination")?;
+            DestinationConfig::Http(HttpDestinationConfig {
+                endpoint,
+                bearer_token: read_secret(token_file)?,
+                ca_file: cli.ca_file,
+            })
+        }
+        DestinationKind::S3 => DestinationConfig::S3(S3DestinationConfig {
+            bucket: cli
+                .s3_bucket
+                .context("OUTPOST_S3_BUCKET is required for the S3 destination")?,
+            prefix: cli
+                .s3_prefix
+                .context("OUTPOST_S3_PREFIX is required for the S3 destination")?,
+            endpoint_url: cli.s3_endpoint_url,
+            force_path_style: cli.s3_force_path_style,
+        }),
+    };
     let internal_token = cli
         .internal_token_file
         .as_deref()
@@ -86,9 +137,7 @@ async fn main() -> Result<()> {
         regional_cell_id: cli.regional_cell_id,
         cluster_name: cli.cluster_name,
         internal_token,
-        endpoint: cli.endpoint,
-        bearer_token,
-        ca_file: cli.ca_file,
+        destination,
         spool_dir: cli.spool_dir,
         spool_max_bytes: cli.spool_max_bytes,
         max_request_bytes: cli.max_request_bytes,

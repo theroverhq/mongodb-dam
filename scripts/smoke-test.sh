@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=load-env.sh
+source "$repo_root/scripts/load-env.sh"
+
 : "${EXPECTED_KUBE_CONTEXT:?Set EXPECTED_KUBE_CONTEXT}"
 current_context="$(kubectl config current-context)"
 if [[ "$current_context" != "$EXPECTED_KUBE_CONTEXT" ]]; then

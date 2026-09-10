@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=load-env.sh
+source "$repo_root/scripts/load-env.sh"
+
 for command_name in kubectl curl jq grep mktemp; do
   command -v "$command_name" >/dev/null || {
     printf 'Missing required command: %s\n' "$command_name" >&2
@@ -10,6 +14,10 @@ done
 
 : "${EXPECTED_KUBE_CONTEXT:?Set EXPECTED_KUBE_CONTEXT to the demo cluster context}"
 : "${BEARER_TOKEN:?Set BEARER_TOKEN to the value configured on Outpost and the demo receiver}"
+if [[ "${OUTPOST_DESTINATION:-http}" != http ]]; then
+  printf '%s\n' 'run-demo.sh requires OUTPOST_DESTINATION=http. For S3, run the API calls and then show-s3-events.sh.' >&2
+  exit 1
+fi
 
 current_context="$(kubectl config current-context)"
 if [[ "$current_context" != "$EXPECTED_KUBE_CONTEXT" ]]; then

@@ -1,4 +1,6 @@
 .git
+.env
+.env.*
 target
 deploy/examples/*.local.yaml
 deploy/examples/*.local.env

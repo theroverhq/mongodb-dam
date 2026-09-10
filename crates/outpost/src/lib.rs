@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use aws_sdk_s3::{primitives::ByteStream, Client as S3Client};
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, State},
@@ -9,12 +10,14 @@ use axum::{
 };
 use dam_schema::{DamBatch, EventPayload, ExternalIdentity, KubernetesMetadata};
 use dam_spool::DurableSpool;
+use flate2::{write::GzEncoder, Compression};
 use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use reqwest::{redirect::Policy, Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -30,9 +33,7 @@ pub struct OutpostConfig {
     pub regional_cell_id: String,
     pub cluster_name: String,
     pub internal_token: Option<String>,
-    pub endpoint: String,
-    pub bearer_token: String,
-    pub ca_file: Option<PathBuf>,
+    pub destination: DestinationConfig,
     pub spool_dir: PathBuf,
     pub spool_max_bytes: u64,
     pub max_request_bytes: usize,
@@ -42,6 +43,28 @@ pub struct OutpostConfig {
     pub kubernetes_ca_path: PathBuf,
     pub kubernetes_refresh_interval: Duration,
     pub identity_mapping_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub enum DestinationConfig {
+    Http(HttpDestinationConfig),
+    S3(S3DestinationConfig),
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpDestinationConfig {
+    pub endpoint: String,
+    pub bearer_token: String,
+    pub ca_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct S3DestinationConfig {
+    pub bucket: String,
+    pub prefix: String,
+    /// Optional S3-compatible endpoint used only for local integration tests.
+    pub endpoint_url: Option<String>,
+    pub force_path_style: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,19 +122,19 @@ impl Metrics {
         )?;
         let delivered_batches = IntCounter::new(
             "mongodb_dam_outpost_delivered_batches_total",
-            "Batches acknowledged by the regional receiver",
+            "Batches successfully delivered to the configured destination",
         )?;
         let delivery_failures = IntCounter::new(
             "mongodb_dam_outpost_delivery_failures_total",
-            "Regional delivery attempts that failed",
+            "Destination delivery attempts that failed",
         )?;
         let quarantined_batches = IntCounter::new(
             "mongodb_dam_outpost_quarantined_batches_total",
-            "Permanently rejected batches retained in the spool",
+            "Permanently rejected HTTP batches retained in the spool",
         )?;
         let spool_items = IntGauge::new(
             "mongodb_dam_outpost_spool_items",
-            "Metadata batches awaiting regional delivery",
+            "Metadata batches awaiting destination delivery",
         )?;
         let spool_bytes = IntGauge::new(
             "mongodb_dam_outpost_spool_bytes",
@@ -203,12 +226,30 @@ fn validate_config(config: &OutpostConfig) -> Result<()> {
         ("source_id", config.source_id.as_str()),
         ("regional_cell_id", config.regional_cell_id.as_str()),
         ("cluster_name", config.cluster_name.as_str()),
-        ("endpoint", config.endpoint.as_str()),
-        ("bearer_token", config.bearer_token.as_str()),
     ] {
         anyhow::ensure!(!value.trim().is_empty(), "{name} must not be empty");
     }
-    let endpoint = Url::parse(&config.endpoint).context("endpoint is invalid")?;
+    match &config.destination {
+        DestinationConfig::Http(destination) => validate_http_destination(destination)?,
+        DestinationConfig::S3(destination) => validate_s3_destination(destination)?,
+    }
+    anyhow::ensure!(
+        config.max_request_bytes > 0,
+        "max_request_bytes must be positive"
+    );
+    Ok(())
+}
+
+fn validate_http_destination(destination: &HttpDestinationConfig) -> Result<()> {
+    anyhow::ensure!(
+        !destination.endpoint.trim().is_empty(),
+        "HTTP endpoint must not be empty"
+    );
+    anyhow::ensure!(
+        !destination.bearer_token.trim().is_empty(),
+        "HTTP bearer token must not be empty"
+    );
+    let endpoint = Url::parse(&destination.endpoint).context("HTTP endpoint is invalid")?;
     let is_local_mock = endpoint.scheme() == "http"
         && matches!(
             endpoint.host_str(),
@@ -216,16 +257,45 @@ fn validate_config(config: &OutpostConfig) -> Result<()> {
         );
     anyhow::ensure!(
         endpoint.scheme() == "https" || is_local_mock,
-        "endpoint must use HTTPS except for the bundled local mock"
+        "HTTP endpoint must use HTTPS except for the bundled local mock"
     );
     anyhow::ensure!(
         endpoint.username().is_empty() && endpoint.password().is_none(),
-        "endpoint must not contain credentials"
+        "HTTP endpoint must not contain credentials"
+    );
+    Ok(())
+}
+
+fn validate_s3_destination(destination: &S3DestinationConfig) -> Result<()> {
+    let bucket = destination.bucket.trim();
+    let prefix = normalized_s3_prefix(&destination.prefix);
+    anyhow::ensure!(!bucket.is_empty(), "S3 bucket must not be empty");
+    anyhow::ensure!(
+        bucket == destination.bucket,
+        "S3 bucket must not have leading or trailing whitespace"
     );
     anyhow::ensure!(
-        config.max_request_bytes > 0,
-        "max_request_bytes must be positive"
+        !bucket.chars().any(char::is_control),
+        "S3 bucket must not contain control characters"
     );
+    anyhow::ensure!(!prefix.is_empty(), "S3 prefix must not be empty");
+    anyhow::ensure!(
+        !prefix.chars().any(char::is_control),
+        "S3 prefix must not contain control characters"
+    );
+    if let Some(value) = destination.endpoint_url.as_deref() {
+        let endpoint = Url::parse(value).context("S3 endpoint URL is invalid")?;
+        let is_local = endpoint.scheme() == "http"
+            && matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost"));
+        anyhow::ensure!(
+            endpoint.scheme() == "https" || is_local,
+            "S3 endpoint URL must use HTTPS except for localhost"
+        );
+        anyhow::ensure!(
+            endpoint.username().is_empty() && endpoint.password().is_none(),
+            "S3 endpoint URL must not contain credentials"
+        );
+    }
     Ok(())
 }
 
@@ -564,10 +634,10 @@ pub fn spawn_background_tasks(state: AppState) {
 }
 
 async fn run_exporter(state: AppState) {
-    let client = match regional_client(&state.config) {
+    let client = match destination_client(&state.config).await {
         Ok(client) => client,
         Err(error) => {
-            error!(error = ?error, "failed to build destination HTTP client");
+            error!(error = ?error, "failed to build destination client");
             return;
         }
     };
@@ -585,13 +655,39 @@ async fn run_exporter(state: AppState) {
     }
 }
 
-fn regional_client(config: &OutpostConfig) -> Result<Client> {
+enum DestinationClient {
+    Http(Client),
+    S3(S3Client),
+}
+
+async fn destination_client(config: &OutpostConfig) -> Result<DestinationClient> {
+    match &config.destination {
+        DestinationConfig::Http(destination) => {
+            Ok(DestinationClient::Http(regional_client(destination)?))
+        }
+        DestinationConfig::S3(destination) => {
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .load()
+                .await;
+            let mut builder = aws_sdk_s3::config::Builder::from(&shared_config);
+            if let Some(endpoint_url) = destination.endpoint_url.as_deref() {
+                builder = builder.endpoint_url(endpoint_url);
+            }
+            if destination.force_path_style {
+                builder = builder.force_path_style(true);
+            }
+            Ok(DestinationClient::S3(S3Client::from_conf(builder.build())))
+        }
+    }
+}
+
+fn regional_client(destination: &HttpDestinationConfig) -> Result<Client> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         // Never forward the source bearer credential to a redirected origin.
         .redirect(Policy::none());
-    if let Some(path) = &config.ca_file {
+    if let Some(path) = &destination.ca_file {
         let pem =
             fs::read(path).with_context(|| format!("reading destination CA {}", path.display()))?;
         builder = builder
@@ -600,37 +696,158 @@ fn regional_client(config: &OutpostConfig) -> Result<Client> {
     builder.build().context("building regional HTTP client")
 }
 
-async fn deliver_pending(state: &AppState, client: &Client) -> Result<()> {
+async fn deliver_pending(state: &AppState, client: &DestinationClient) -> Result<()> {
     for item in state.spool.pending()? {
         let body = state.spool.read(&item)?;
         let batch: DamBatch = serde_json::from_slice(&body)
             .with_context(|| format!("spooled batch {} is invalid", item.id))?;
-        let response = client
-            .post(&state.config.endpoint)
-            .header("content-type", "application/json")
-            .bearer_auth(&state.config.bearer_token)
-            .header("idempotency-key", &batch.batch_id)
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("delivery request for batch {} failed", batch.batch_id))?;
-
-        let status = response.status();
-        if status.is_success() || status == reqwest::StatusCode::CONFLICT {
-            state.spool.acknowledge(&item)?;
+        let delivered = match (&state.config.destination, client) {
+            (DestinationConfig::Http(destination), DestinationClient::Http(client)) => {
+                if deliver_http_batch(client, destination, &batch, body).await? {
+                    state.spool.acknowledge(&item)?;
+                    true
+                } else {
+                    state.spool.quarantine(&item)?;
+                    state.metrics.quarantined_batches.inc();
+                    false
+                }
+            }
+            (DestinationConfig::S3(destination), DestinationClient::S3(client)) => {
+                deliver_s3_batch(client, destination, &batch).await?;
+                state.spool.acknowledge(&item)?;
+                true
+            }
+            _ => anyhow::bail!("destination configuration and client do not match"),
+        };
+        if delivered {
             state.metrics.delivered_batches.inc();
-            info!(batch_id = %batch.batch_id, status = %status, "regional receiver acknowledged DAM batch");
-            continue;
         }
-        if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
-            state.spool.quarantine(&item)?;
-            state.metrics.quarantined_batches.inc();
-            warn!(batch_id = %batch.batch_id, status = %status, "regional receiver permanently rejected DAM batch; retaining it for operator review");
-            continue;
-        }
-        anyhow::bail!("regional receiver returned retryable HTTP {status}");
     }
     Ok(())
+}
+
+/// Returns true when the spool item can be acknowledged and false when a
+/// permanent response requires quarantine.
+async fn deliver_http_batch(
+    client: &Client,
+    destination: &HttpDestinationConfig,
+    batch: &DamBatch,
+    body: Vec<u8>,
+) -> Result<bool> {
+    let response = client
+        .post(&destination.endpoint)
+        .header("content-type", "application/json")
+        .bearer_auth(&destination.bearer_token)
+        .header("idempotency-key", &batch.batch_id)
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("delivery request for batch {} failed", batch.batch_id))?;
+
+    let status = response.status();
+    if status.is_success() || status == reqwest::StatusCode::CONFLICT {
+        info!(batch_id = %batch.batch_id, status = %status, "regional receiver acknowledged DAM batch");
+        return Ok(true);
+    }
+    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        warn!(batch_id = %batch.batch_id, status = %status, "regional receiver permanently rejected DAM batch; retaining it for operator review");
+        return Ok(false);
+    }
+    anyhow::bail!("regional receiver returned retryable HTTP {status}")
+}
+
+async fn deliver_s3_batch(
+    client: &S3Client,
+    destination: &S3DestinationConfig,
+    batch: &DamBatch,
+) -> Result<()> {
+    let key = s3_object_key(destination, batch);
+    let body = encode_s3_ndjson(batch)?;
+    client
+        .put_object()
+        .bucket(&destination.bucket)
+        .key(&key)
+        .content_type("application/x-ndjson")
+        .content_encoding("gzip")
+        .body(ByteStream::from(body))
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "S3 PutObject failed for batch {} at s3://{}/{}: {error}",
+                batch.batch_id,
+                destination.bucket,
+                key
+            )
+        })?;
+    info!(
+        batch_id = %batch.batch_id,
+        bucket = %destination.bucket,
+        key = %key,
+        "uploaded compressed DAM NDJSON batch"
+    );
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct S3NdjsonRecord<'a> {
+    batch_schema_version: u16,
+    batch_id: &'a str,
+    #[serde(with = "time::serde::rfc3339")]
+    batch_created_at: time::OffsetDateTime,
+    #[serde(flatten)]
+    event: &'a dam_schema::DamEvent,
+}
+
+fn encode_s3_ndjson(batch: &DamBatch) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    for event in &batch.events {
+        let record = S3NdjsonRecord {
+            batch_schema_version: batch.schema_version,
+            batch_id: &batch.batch_id,
+            batch_created_at: batch.created_at,
+            event,
+        };
+        serde_json::to_writer(&mut encoder, &record).context("serializing S3 NDJSON record")?;
+        encoder
+            .write_all(b"\n")
+            .context("writing S3 NDJSON delimiter")?;
+    }
+    encoder.finish().context("finishing S3 gzip payload")
+}
+
+fn s3_object_key(destination: &S3DestinationConfig, batch: &DamBatch) -> String {
+    let timestamp = batch.created_at;
+    format!(
+        "{}/customer_id={}/tenant_id={}/regional_cell_id={}/source_id={}/date={:04}-{:02}-{:02}/hour={:02}/{}.ndjson.gz",
+        normalized_s3_prefix(&destination.prefix),
+        encode_s3_key_segment(&batch.customer_id),
+        encode_s3_key_segment(&batch.tenant_id),
+        encode_s3_key_segment(&batch.regional_cell_id),
+        encode_s3_key_segment(&batch.source_id),
+        timestamp.year(),
+        u8::from(timestamp.month()),
+        timestamp.day(),
+        timestamp.hour(),
+        encode_s3_key_segment(&batch.batch_id),
+    )
+}
+
+fn normalized_s3_prefix(prefix: &str) -> &str {
+    prefix.trim().trim_matches('/')
+}
+
+fn encode_s3_key_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
 }
 
 #[derive(Deserialize)]
@@ -749,18 +966,15 @@ pub fn read_secret(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rejects_non_tls_remote_endpoint() {
-        let config = OutpostConfig {
+    fn test_config(destination: DestinationConfig) -> OutpostConfig {
+        OutpostConfig {
             customer_id: "customer".into(),
             tenant_id: "tenant".into(),
             source_id: "source".into(),
             regional_cell_id: "cell".into(),
             cluster_name: "cluster".into(),
             internal_token: None,
-            endpoint: "http://remote.example/ingest".into(),
-            bearer_token: "token".into(),
-            ca_file: None,
+            destination,
             spool_dir: PathBuf::from("/tmp/not-used"),
             spool_max_bytes: 1024,
             max_request_bytes: 1024,
@@ -770,13 +984,177 @@ mod tests {
             kubernetes_ca_path: PathBuf::new(),
             kubernetes_refresh_interval: Duration::from_secs(60),
             identity_mapping_file: None,
-        };
+        }
+    }
+
+    #[test]
+    fn rejects_non_tls_remote_endpoint() {
+        let config = test_config(DestinationConfig::Http(HttpDestinationConfig {
+            endpoint: "http://remote.example/ingest".into(),
+            bearer_token: "token".into(),
+            ca_file: None,
+        }));
         assert!(validate_config(&config).is_err());
 
         let mut prefixed_mock = config;
-        prefixed_mock.endpoint =
-            "http://mock-endpoint.attacker.example/v1/ingest/mongodb-dam".into();
+        let DestinationConfig::Http(destination) = &mut prefixed_mock.destination else {
+            unreachable!();
+        };
+        destination.endpoint = "http://mock-endpoint.attacker.example/v1/ingest/mongodb-dam".into();
         assert!(validate_config(&prefixed_mock).is_err());
+    }
+
+    #[test]
+    fn validates_s3_destination() {
+        let config = test_config(DestinationConfig::S3(S3DestinationConfig {
+            bucket: "dam-demo-events".into(),
+            prefix: "/mongodb-dam/events/".into(),
+            endpoint_url: None,
+            force_path_style: false,
+        }));
+        assert!(validate_config(&config).is_ok());
+
+        let invalid = test_config(DestinationConfig::S3(S3DestinationConfig {
+            bucket: "dam-demo-events".into(),
+            prefix: "///".into(),
+            endpoint_url: None,
+            force_path_style: false,
+        }));
+        assert!(validate_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn creates_deterministic_partitioned_s3_key() {
+        let batch: DamBatch =
+            serde_json::from_slice(include_bytes!("../../../tests/fixtures/dam-batch.json"))
+                .unwrap();
+        let destination = S3DestinationConfig {
+            bucket: "dam-demo-events".into(),
+            prefix: "/mongodb-dam/events/".into(),
+            endpoint_url: None,
+            force_path_style: false,
+        };
+        assert_eq!(
+            s3_object_key(&destination, &batch),
+            "mongodb-dam/events/customer_id=integration-customer/tenant_id=integration-tenant/regional_cell_id=integration-cell/source_id=integration-source/date=2026-01-01/hour=00/integration-batch-0001.ndjson.gz"
+        );
+    }
+
+    #[test]
+    fn encodes_one_self_contained_json_record_per_event() {
+        use std::io::Read;
+
+        let batch: DamBatch =
+            serde_json::from_slice(include_bytes!("../../../tests/fixtures/dam-batch.json"))
+                .unwrap();
+        let compressed = encode_s3_ndjson(&batch).unwrap();
+        assert_eq!(&compressed[0..2], &[0x1f, 0x8b]);
+        assert_eq!(compressed, encode_s3_ndjson(&batch).unwrap());
+
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_string(&mut decoded)
+            .unwrap();
+        let records: Vec<serde_json::Value> = decoded
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), batch.events.len());
+        assert_eq!(records[0]["batch_schema_version"], 1);
+        assert_eq!(records[0]["batch_id"], "integration-batch-0001");
+        assert_eq!(records[0]["batch_created_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(records[0]["event_type"], "sensor_health");
+        assert_eq!(records[1]["event_type"], "mongodb_activity");
+        assert_eq!(records[1]["details"]["command"], "delete");
+    }
+
+    #[test]
+    fn documented_s3_examples_match_the_event_schema() {
+        let markdown = include_str!("../../../docs/S3_NDJSON_EXAMPLES.md");
+        let examples: Vec<_> = markdown
+            .split("```json\n")
+            .skip(1)
+            .map(|remainder| remainder.split("\n```").next().unwrap())
+            .collect();
+        assert_eq!(examples.len(), 8);
+
+        for example in examples {
+            let mut value: serde_json::Value = serde_json::from_str(example).unwrap();
+            let object = value.as_object_mut().unwrap();
+            assert_eq!(object.remove("batch_schema_version").unwrap(), 1);
+            assert!(object.remove("batch_id").unwrap().is_string());
+            assert!(object.remove("batch_created_at").unwrap().is_string());
+            let event: dam_schema::DamEvent = serde_json::from_value(value).unwrap();
+            assert!(event.capture.metadata_only);
+        }
+    }
+
+    #[tokio::test]
+    async fn uploads_batch_to_the_deterministic_s3_object() {
+        use axum::{http::Uri, routing::put};
+        use std::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(None));
+        let capture = captured.clone();
+        let app = Router::new().route(
+            "/*key",
+            put(move |uri: Uri, headers: HeaderMap, body: Bytes| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().unwrap() = Some((uri, headers, body));
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test-access-key",
+                "test-secret-key",
+                None,
+                None,
+                "outpost-test",
+            ))
+            .endpoint_url(format!("http://{address}"))
+            .force_path_style(true)
+            .build();
+        let client = S3Client::from_conf(config);
+        let destination = S3DestinationConfig {
+            bucket: "dam-demo-events".into(),
+            prefix: "mongodb-dam/events".into(),
+            endpoint_url: Some(format!("http://{address}")),
+            force_path_style: true,
+        };
+        let batch: DamBatch =
+            serde_json::from_slice(include_bytes!("../../../tests/fixtures/dam-batch.json"))
+                .unwrap();
+
+        deliver_s3_batch(&client, &destination, &batch)
+            .await
+            .unwrap();
+        server.abort();
+
+        let captured = captured.lock().unwrap();
+        let (uri, headers, body) = captured.as_ref().expect("mock S3 did not receive a PUT");
+        assert_eq!(
+            uri.path(),
+            "/dam-demo-events/mongodb-dam/events/customer_id%3Dintegration-customer/tenant_id%3Dintegration-tenant/regional_cell_id%3Dintegration-cell/source_id%3Dintegration-source/date%3D2026-01-01/hour%3D00/integration-batch-0001.ndjson.gz"
+        );
+        assert_eq!(headers.get("content-type").unwrap(), "application/x-ndjson");
+        assert!(headers
+            .get("content-encoding")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("gzip"));
+        assert!(!body.is_empty());
     }
 
     #[test]

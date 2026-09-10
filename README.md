@@ -1,6 +1,6 @@
 # MongoDB DAM
 
-Standalone customer-cluster components for a MongoDB Database Activity Monitoring product. This repository deploys MongoDB Community, one eBPF Observer per Linux node, and a durable Outpost that sends sanitized metadata to a configured regional endpoint over HTTPS with bearer authentication. The destination is intentionally opaque to this repository and is not assumed to be Collect.
+Standalone customer-cluster components for a MongoDB Database Activity Monitoring product. This repository deploys MongoDB Community, one eBPF Observer per Linux node, and a durable Outpost that uploads sanitized metadata to a configured S3 bucket as gzip-compressed NDJSON. A bearer-authenticated HTTP destination remains available for the bundled local receiver and compatibility tests.
 
 It has no dependency on the Foundry infrastructure repository and contains no GitHub Actions. Building, pushing, and deployment are initiated locally.
 
@@ -15,7 +15,8 @@ flowchart LR
         M -->|syscalls, TCP, uprobes, scheduling| O
         O -->|metadata only| Q -->|authenticated HTTP| P --> S
     end
-    S -->|outbound HTTPS + Bearer token<br/>idempotent batches| C[Configured regional ingress endpoint]
+    S -->|S3 PutObject<br/>gzip NDJSON| B[(Configured S3 bucket)]
+    B -. future consumer .-> C[Regional Collect ingestion]
 ```
 
 ## What is implemented
@@ -27,8 +28,9 @@ flowchart LR
 - Plaintext UDP DNS query/response metadata for MongoDB processes, including name, record type, response code, answer count, and correlated duration.
 - `pread`, `pwrite`, `fsync`, `fdatasync`, `openat`, slow page-fault, scheduler off-CPU, on-CPU stack, and `pthread_mutex_lock` wait telemetry.
 - MongoDB process exec/exit tracking, socket endpoint lookup, pod UID extraction from cgroups, and Outpost enrichment from the Kubernetes API.
-- A versioned metadata-only event contract, node-local and Outpost durable spools, assignment validation, internal authentication, regional token authentication, custom CA support, idempotency keys, health endpoints, and Prometheus metrics.
-- Optional demo-only Outpost enrichment that maps a salted MongoDB principal to an AWS IAM principal and the exact Secrets Manager credential ARN before HTTP push.
+- A versioned metadata-only event contract, node-local and Outpost durable spools, assignment validation, internal authentication, deterministic S3 object keys, gzip NDJSON encoding, health endpoints, and Prometheus metrics.
+- Optional demo-only Outpost enrichment that maps a salted MongoDB principal to an AWS IAM principal and the exact Secrets Manager credential ARN before export.
+- An optional bearer-authenticated HTTPS exporter retained for the bundled receiver and legacy integration tests.
 - A generic mock endpoint for integration testing.
 
 The chart pins the official Community image to `mongo:8.0.29-noble`. Override it through `mongodb.image` when your patch-management process approves a newer Community release.
@@ -45,17 +47,55 @@ MongoDB authentication principals are never emitted in clear text. Observer extr
 - For the pinned MongoDB 8 image, avoid Linux kernels 6.19 through 7.0.13. [MongoDB documents that it refuses to start on that range](https://www.mongodb.com/docs/manual/release-notes/8.0/#mongodb-is-incompatible-with-linux-kernel-6.19-through-7.0.13); the deployment preflight detects affected nodes.
 - `docker`, `kubectl`, Helm 3/4, and access to a container registry reachable from the customer account.
 - A dedicated namespace that may carry the `pod-security.kubernetes.io/enforce=privileged` label.
-- Outbound DNS and HTTPS from Outpost to the regional cell. There is no inbound cross-account connection.
-- A regional HTTP-push endpoint matching [the contract](docs/HTTP_PUSH_CONTRACT.md). Until the regional receiver is built, Outpost retains batches on its PVC or can target the bundled mock endpoint.
+- Outbound DNS and HTTPS from Outpost to the configured S3 service. There is no inbound cross-account connection.
+- An existing S3 bucket and credentials that allow `s3:PutObject` under the configured prefix. See the [S3 export contract](docs/S3_EXPORT_CONTRACT.md). Until access is available, Outpost retains batches on its PVC.
 
 Managed environments that prohibit privileged DaemonSets—such as many serverless Kubernetes node offerings—cannot host Observer. Atlas database nodes are also out of scope because customers cannot attach probes to them.
+
+## Configure one local `.env`
+
+All local entry-point scripts automatically load `.env` from the repository root. Generate it once:
+
+```bash
+./scripts/generate-secrets.sh
+```
+
+The generator copies the complete configuration contract from [.env.example](.env.example), replaces the four `generate-me` secret placeholders with random values, writes `.env` with mode `0600`, and refuses to overwrite it. Edit the blank account-specific values in `.env` before building or deploying:
+
+```dotenv
+EXPECTED_KUBE_CONTEXT=customer-demo-context
+REGISTRY=111122223333.dkr.ecr.ap-south-1.amazonaws.com
+
+OUTPOST_S3_BUCKET=customer-demo-dam-events
+OUTPOST_AWS_ACCESS_KEY_ID=replace-with-temporary-demo-key
+OUTPOST_AWS_SECRET_ACCESS_KEY=replace-with-temporary-demo-secret
+
+AWS_PROFILE=dam-admin
+DIRECT_USER_AWS_PROFILE=dam-user
+DEMO_IAM_PRINCIPAL_ARN=arn:aws:iam::111122223333:user/dam-demo-alice
+```
+
+The generated file already contains the customer/source IDs, region, S3 prefix, image tag, demo flags, MongoDB settings, ports, and optional HTTP settings. Review every value; do not leave required values blank. `.env` is gitignored, excluded from the Docker build context, and must not be committed.
+
+The AWS identity fields are deliberately separate:
+
+| Purpose | `.env` fields | Used by |
+| --- | --- | --- |
+| Local administrator | `AWS_PROFILE` or standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Provisioning and S3 inspection |
+| Outpost uploader | `OUTPOST_AWS_ACCESS_KEY_ID` / `OUTPOST_AWS_SECRET_ACCESS_KEY` / `OUTPOST_AWS_SESSION_TOKEN` | Copied to the Outpost Kubernetes Secret |
+| Simulated customer user | `DIRECT_USER_AWS_PROFILE` or `DIRECT_USER_AWS_ACCESS_KEY_ID` / `DIRECT_USER_AWS_SECRET_ACCESS_KEY` / `DIRECT_USER_AWS_SESSION_TOKEN` | Bulk-delete and post-revocation verification |
+
+An explicitly supplied variable wins over the value in `.env`, so a safe one-command override remains possible:
+
+```bash
+TAG=v0.1.1-dam-demo ./scripts/build-images.sh
+```
+
+Set `ENV_FILE=/absolute/path/to/another.env` to use a different file. If that explicit file does not exist, the script fails. Raw commands such as `aws` do not load `.env`; only repository entry-point scripts do.
 
 ## Build and push locally
 
 ```bash
-REGISTRY=111122223333.dkr.ecr.ap-south-1.amazonaws.com \
-TAG=v0.1.0 \
-PUSH_IMAGES=true \
 ./scripts/build-images.sh
 ```
 
@@ -66,6 +106,7 @@ Run the full Rust/eBPF build-time suite and the disposable Outpost contract test
 
 ```bash
 make test-container
+make test-env
 make test-http-push
 make test-secret-access
 ```
@@ -74,54 +115,68 @@ On a Linux Docker host that permits privileged containers, run the live probe-to
 
 ## Run the presentation demo
 
-The opt-in demo mode adds a constrained REST application and an in-memory receiver so a presenter can seed dummy commerce data, call `find`/`insert`/`update`/`aggregate`/`delete` operations over HTTP from a client machine, and immediately display the metadata that Observer captured and Outpost delivered.
+The opt-in demo mode adds a constrained REST application so a presenter can seed dummy commerce data, call `find`/`insert`/`update`/`aggregate`/`delete` operations over HTTP from a client machine, and display the metadata that Observer captured and Outpost uploaded. S3 mode is the cross-account path. HTTP mode additionally deploys an in-memory receiver for completely local presentations.
 
-Build it with `BUILD_DEMO=true`, deploy with `DEMO_MODE=true` and `deploy/examples/demo-values.yaml`, then run `scripts/run-demo.sh`. The exact setup and individual curl commands are in the [three-step demo walkthrough](docs/DEMO.md). MongoDB Community itself does not expose a general-purpose REST query API; the bundled demo API provides that application layer.
+Build it with `BUILD_DEMO=true`, then deploy with `DEMO_MODE=true` and `deploy/examples/s3-demo-values.yaml`; the exact S3 flow is at the end of this README. For a no-AWS local run, use `deploy/examples/demo-values.yaml` and `scripts/run-demo.sh`; individual curl commands are in the [local three-step walkthrough](docs/DEMO.md). MongoDB Community itself does not expose a general-purpose REST query API; the bundled demo API provides that application layer.
 
 ## Deploy to the other cloud account
 
 The deployment script refuses to continue unless the active kubecontext exactly matches `EXPECTED_KUBE_CONTEXT`. This is the guardrail against accidentally deploying to the Foundry/current account.
 
-Generate a local ignored secret file once:
+Generate and edit the root configuration once, if it does not already exist:
 
 ```bash
 ./scripts/generate-secrets.sh
-set -a
-source deploy/examples/secrets.local.env
-set +a
+${EDITOR:-vi} .env
 ```
 
-Replace the generated `BEARER_TOKEN` with the token provisioned for this source at the regional endpoint, or provision the generated value there. Then deploy:
+For the S3 demo path, the required `.env` fields are:
+
+```dotenv
+EXPECTED_KUBE_CONTEXT=customer-production
+CUSTOMER_ID=customer-acme
+TENANT_ID=tenant-acme
+SOURCE_ID=mongodb-prod-ap-south-1
+REGIONAL_CELL_ID=cell-ap-south-1
+CLUSTER_NAME=acme-production-eks
+OUTPOST_DESTINATION=s3
+OUTPOST_S3_BUCKET=customer-acme-dam-demo
+OUTPOST_S3_PREFIX=mongodb-dam/events
+AWS_REGION=ap-south-1
+
+# Demoware only. Temporary credentials need all three fields.
+OUTPOST_AWS_ACCESS_KEY_ID=replace-with-temporary-demo-key
+OUTPOST_AWS_SECRET_ACCESS_KEY=replace-with-temporary-demo-secret
+OUTPOST_AWS_SESSION_TOKEN=
+
+REGISTRY=111122223333.dkr.ecr.ap-south-1.amazonaws.com
+TAG=v0.1.0
+VALUES_FILE=deploy/examples/customer-values.yaml
+MONGODB_IMAGE_TAG=8.0.29-noble
+```
+
+Then run:
 
 ```bash
-export EXPECTED_KUBE_CONTEXT=customer-production
-export CUSTOMER_ID=customer-acme
-export TENANT_ID=tenant-acme
-export SOURCE_ID=mongodb-prod-ap-south-1
-export REGIONAL_CELL_ID=cell-ap-south-1
-export CLUSTER_NAME=acme-production-eks
-export ENDPOINT=https://ingress.cell-ap-south-1.example.com/v1/ingest/mongodb-dam
-export OBSERVER_IMAGE_REPOSITORY=111122223333.dkr.ecr.ap-south-1.amazonaws.com/mongodb-dam-observer
-export OUTPOST_IMAGE_REPOSITORY=111122223333.dkr.ecr.ap-south-1.amazonaws.com/mongodb-dam-outpost
-export TAG=v0.1.0
-export VALUES_FILE=deploy/examples/customer-values.yaml
-# Set this when overriding mongodb.image.tag so preflight checks that version.
-export MONGODB_IMAGE_TAG=8.0.29-noble
-
+./scripts/build-images.sh
 ./scripts/deploy.sh
 ./scripts/smoke-test.sh
 ```
 
-Set `ENDPOINT_CA_FILE=/path/to/ca.pem` when the endpoint uses a private CA. Secrets are staged in a mode-0700 temporary directory, applied as a Kubernetes Secret, and removed when the script exits.
+The script also accepts an existing credential Secret through `OUTPOST_S3_CREDENTIALS_SECRET`; omit static credential variables entirely when the cluster supplies EKS Pod Identity, IRSA, or another AWS SDK provider. Static global-administrator credentials are suitable only for this disposable demo. Secrets are staged in a mode-0700 temporary directory, applied as Kubernetes Secrets, and removed from that directory when the script exits.
+
+When `REGISTRY` is set, both build and deploy derive all component image repositories from it; the explicit `*_IMAGE_REPOSITORY` fields are only overrides. The deploy script copies `OUTPOST_AWS_ACCESS_KEY_ID`, `OUTPOST_AWS_SECRET_ACCESS_KEY`, and optional `OUTPOST_AWS_SESSION_TOKEN` into the Outpost Kubernetes Secret. The scoped names prevent those credentials from changing the local AWS CLI identity. The legacy standard `AWS_*` credential names remain accepted when `OUTPOST_AWS_*` are absent.
+
+To retain the old local HTTP receiver path, set `OUTPOST_DESTINATION=http`, `ENDPOINT`, and `BEARER_TOKEN`. The HTTP contract is documented separately in [HTTP_PUSH_CONTRACT.md](docs/HTTP_PUSH_CONTRACT.md).
 
 ## Repository map
 
 - `bpf/`: CO-RE eBPF programs and the minimal build-time kernel type header.
 - `crates/observer/`: probe loader, bounded sanitizer, correlation, enrichment, batching, and node spool.
-- `crates/outpost/`: authenticated intake, Kubernetes enrichment, PVC spool, and HTTPS exporter.
+- `crates/outpost/`: authenticated intake, Kubernetes enrichment, PVC spool, and S3 gzip-NDJSON/HTTPS exporters.
 - `crates/mongo-protocol/`: safe MongoDB wire/BSON metadata decoder.
 - `crates/schema/`: the only serializable data model allowed out of the customer node.
-- `crates/mock-endpoint/`: local stand-in for the configured regional endpoint.
+- `crates/mock-endpoint/`: local stand-in for the optional HTTP destination.
 - `demo/api/`: disposable HTTP application that creates visible MongoDB activity.
 - `deploy/helm/mongodb-dam/`: single Helm chart for the customer cluster.
 - `scripts/`: local build, preflight, deployment, and smoke-test entry points.
@@ -136,9 +191,9 @@ The profiler emits raw instruction addresses for later symbolization; regional f
 
 See [known gaps](docs/KNOWN_GAPS.md) and [operations](docs/OPERATIONS.md) before production use.
 
-## Exact three-step DAM demo
+## Exact three-step DAM demo (local HTTP receiver)
 
-The three-step DAM demo is implemented. It uses a small REST service backed by the official [PyMongo driver](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/), plus an in-memory receiver for viewing Outpost deliveries.
+This local variant uses a small REST service backed by the official [PyMongo driver](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/), plus an in-memory receiver for viewing Outpost deliveries. Use the final S3 section for the cross-account presentation.
 
 I did not deploy it because the active kubecontext is still `rover-dev-auto`, not your separate customer/demo account. Full build and deployment commands are in [DEMO.md](docs/DEMO.md#deploy-demo-mode).
 
@@ -185,11 +240,10 @@ Observer performs the capture; Outpost validates, enriches, and delivers it.
 The easiest option runs the entire presentation and prints sanitized events plus Observer/Outpost counters:
 
 ```bash
-export EXPECTED_KUBE_CONTEXT=<customer-demo-context>
-# BEARER_TOKEN should already be loaded from secrets.local.env
-
 ./scripts/run-demo.sh
 ```
+
+For this local-only helper, set `EXPECTED_KUBE_CONTEXT`, `OUTPOST_DESTINATION=http`, `ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam`, and `VALUES_FILE=deploy/examples/demo-values.yaml` in `.env`. The generated `BEARER_TOKEN` is already there.
 
 The output table includes:
 
@@ -201,11 +255,11 @@ It should show `find`, `insert`, `update`, `aggregate`, and `delete`, without qu
 
 The implementation is in [run-demo.sh](scripts/run-demo.sh), and the demo Kubernetes components are in [demo.yaml](deploy/helm/mongodb-dam/templates/demo.yaml).
 
-Validation passed: 31 Rust tests, strict Clippy, Helm lint/render, demo API integration, mocked Secrets Manager denial verification, Bearer-protected Outpost delivery/quarantine with trusted IAM enrichment, and a privileged live eBPF test covering SCRAM attribution, a captured 35-document bulk delete, IAM enrichment, TCP lifecycle telemetry, and clear-value redaction. The live test uses MongoDB Community 7 on hosts whose kernel cannot run MongoDB 8; the chart remains pinned to Community 8 for supported cluster kernels.
+The repository includes Rust tests, strict Clippy checks, Helm lint/render checks, demo API integration, mocked Secrets Manager denial verification, HTTP compatibility tests, an S3 upload test, and a privileged live eBPF test covering SCRAM attribution, a captured 35-document bulk delete, IAM enrichment, TCP lifecycle telemetry, and clear-value redaction. The live test uses MongoDB Community 7 on hosts whose kernel cannot run MongoDB 8; the chart remains pinned to Community 8 for supported cluster kernels.
 
 ## Exact AWS IAM user → direct MongoDB activity capture demo
 
-This is the end-to-end capture storyline for the MVP. It does not call the demo REST API for the destructive action. A `mongosh` client connects directly to MongoDB, authenticates as a dedicated database user, executes `deleteMany`, and produces an attributed activity event that Observer sends through Outpost. This repository does not decide whether that activity is malicious; Collect and Sentinel will do that after HTTP push is integrated.
+This is the end-to-end capture storyline for the MVP. It does not call the demo REST API for the destructive action. A `mongosh` client connects directly to MongoDB, authenticates as a dedicated database user, executes `deleteMany`, and produces an attributed activity event that Observer sends through Outpost to S3. This repository does not decide whether that activity is malicious; Collect and Sentinel will do that after the regional cell consumes the S3 export.
 
 ### Read this identity boundary first
 
@@ -217,7 +271,7 @@ AWS IAM user
           └── secret maps IAM ARN to one MongoDB SCRAM user
                 └── mongosh connects directly to MongoDB
                       └── Observer hashes the SCRAM username and attributes commands
-                            └── Outpost joins the protected IAM mapping and HTTP-pushes metadata
+                            └── Outpost joins the protected IAM mapping and uploads gzip NDJSON to S3
 ```
 
 AWS IAM is the gate for obtaining the database credential; MongoDB Community performs SCRAM-SHA-256 authentication. The clear IAM ARN and Secrets Manager ARN are stored in a protected, demo-only Kubernetes Secret mounted only into Outpost. Outpost performs the trusted join and exports those identifiers as metadata. Passwords, AWS credentials, delete filters, and document bodies are not exported.
@@ -230,14 +284,14 @@ In the MongoDB wire command, [`limit: 0` identifies a multi-delete and response 
 - That identity uses `mongosh` directly; the destructive query does not pass through the REST API.
 - Observer correlates the SCRAM exchange to the same physical MongoDB connection.
 - The exported `mongodb_activity` contains the IAM user ARN, AWS account ID, credential-secret ARN, salted MongoDB principal hash, `delete_scope=multi`, and `affected_documents=35`.
-- Outpost receives that activity, replaces any untrusted incoming identity with its protected mapping, adds available Kubernetes metadata, and delivers it to the exact configured HTTP endpoint.
+- Outpost receives that activity, replaces any untrusted incoming identity with its protected mapping, adds available Kubernetes metadata, and uploads it under the exact configured S3 bucket and prefix.
 - A later Collect/Sentinel pipeline can match rules against the activity without putting detection logic in the customer cluster.
 
 ### Prerequisites for this flow
 
 Use the separate customer/demo AWS account and cluster, not the Foundry/current account. You need:
 
-- the demo deployment from this repository, with its in-memory receiver enabled;
+- the S3 demo deployment from this repository and access to read its configured prefix;
 - an AWS administrator profile that can manage one Secrets Manager secret;
 - an existing same-account IAM user for the simulated database user;
 - a second AWS CLI profile that actually assumes/uses that IAM identity;
@@ -253,34 +307,16 @@ Skip this step only if the current demo images, including the direct-user captur
 From the repository root in the administrator terminal:
 
 ```bash
-export REGISTRY=111122223333.dkr.ecr.ap-south-1.amazonaws.com
-export TAG=v0.1.0-dam-demo
-
-BUILD_DEMO=true PUSH_IMAGES=true ./scripts/build-images.sh
-
-# Run this only once. It refuses to overwrite an existing local secret file.
+# Run this only once. It creates the complete ignored root .env and refuses
+# to overwrite an existing one.
 ./scripts/generate-secrets.sh
-set -a
-source deploy/examples/secrets.local.env
-set +a
-
-export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
-export CUSTOMER_ID=customer-demo
-export TENANT_ID=tenant-demo
-export SOURCE_ID=mongodb-demo
-export REGIONAL_CELL_ID=cell-demo
-export CLUSTER_NAME=customer-demo-cluster
-export DEMO_MODE=true
-export ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam
-export VALUES_FILE=deploy/examples/demo-values.yaml
-export OBSERVER_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-observer"
-export OUTPOST_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-outpost"
-export DEMO_API_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-demo-api"
-export DEMO_RECEIVER_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-mock-endpoint"
-
+${EDITOR:-vi} .env
+./scripts/build-images.sh
 ./scripts/deploy.sh
 ./scripts/smoke-test.sh
 ```
+
+Before running those commands, fill every blank account-specific value in `.env`. In particular, set `EXPECTED_KUBE_CONTEXT`, `REGISTRY`, `OUTPOST_S3_BUCKET`, the `OUTPOST_AWS_*` credential set, an administrator profile or standard credential set, a direct-user profile or `DIRECT_USER_AWS_*` credential set, and `DEMO_IAM_PRINCIPAL_ARN`. The remaining demo defaults are already complete. Temporary credentials also require their matching session-token field.
 
 The deployment refuses to proceed unless the active context exactly equals `EXPECTED_KUBE_CONTEXT`.
 
@@ -290,14 +326,13 @@ Confirm the rollout:
 kubectl -n mongodb-dam get pods -o wide
 ```
 
-MongoDB, Outpost, the demo API, and the demo receiver should be ready, and there should be one ready Observer on the MongoDB node.
+MongoDB, Outpost, and the demo API should be ready, and there should be one ready Observer on the MongoDB node. S3 mode does not deploy the in-memory HTTP receiver.
 
 ### Step 1 — seed the 35 disposable records
 
 In administrator terminal 1, keep the API forward running:
 
 ```bash
-export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
 kubectl -n mongodb-dam port-forward service/mongodb-dam-demo-api 8080:8080
 ```
 
@@ -324,17 +359,9 @@ The destructive-user scenario targets only `dam_demo.customer_records` documents
 
 ### Step 2 — choose the IAM identity and provision its direct database user
 
-In administrator terminal 2, select your administrator AWS profile and the existing IAM user that will act as the database user:
+In `.env`, set the local administrator profile or standard credentials and set `DEMO_IAM_PRINCIPAL_ARN` to the existing same-account IAM user that will act as the database user. Then run:
 
 ```bash
-export AWS_PROFILE=dam-admin
-export AWS_REGION=ap-south-1
-export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
-export DEMO_AWS_SECRET_ID=mongodb-dam/demo/direct-user
-
-export DEMO_IAM_PRINCIPAL_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:user/dam-demo-alice"
-
 ./scripts/provision-direct-user.sh
 ```
 
@@ -359,11 +386,13 @@ AWS secret ARN:      arn:aws:secretsmanager:ap-south-1:111122223333:secret:...
 The password was written only to AWS Secrets Manager and was not printed.
 ```
 
-Verify that the second CLI profile really represents the selected IAM user:
+If you selected the profile form, verify that it really represents the selected IAM user:
 
 ```bash
-AWS_PROFILE=dam-user aws sts get-caller-identity
+aws --profile dam-user sts get-caller-identity
 ```
+
+Use the same profile name in `DIRECT_USER_AWS_PROFILE` in `.env`, or fill the scoped `DIRECT_USER_AWS_*` keys instead. The direct-user scripts isolate either choice from the administrator identity, preventing an administrator key from being mistaken for the simulated user.
 
 Do not continue unless this is the intended demo user. If `GetSecretValue` is denied despite the secret resource policy, check that identity's permissions boundary and your Organizations SCPs for an explicit deny.
 
@@ -372,7 +401,6 @@ Do not continue unless this is the intended demo user. If `GetSecretValue` is de
 Keep this running in administrator terminal 3:
 
 ```bash
-export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
 kubectl -n mongodb-dam port-forward service/mongodb-dam-mongodb 27018:27017
 ```
 
@@ -380,21 +408,13 @@ This keeps MongoDB private; it does not expose a public LoadBalancer. The next c
 
 ### Step 4 — run the bulk delete as the IAM-mapped user
 
-Open the simulated user's terminal. Select the user profile, verify it, and run:
+Open the simulated user's terminal and run:
 
 ```bash
-export AWS_PROFILE=dam-user
-export AWS_REGION=ap-south-1
-export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export DEMO_IAM_PRINCIPAL_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:user/dam-demo-alice"
-export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
-export DEMO_AWS_SECRET_ID=mongodb-dam/demo/direct-user
-export USE_EXISTING_MONGODB_FORWARD=true
-export MONGODB_LOCAL_PORT=27018
-
-aws sts get-caller-identity
 ./scripts/direct-user-bulk-delete.sh
 ```
+
+The script loads the region, expected context, principal ARN, secret ID, tunnel port, and direct-user AWS profile or keys from `.env`. It prints the resolved AWS caller before opening the direct MongoDB connection and refuses an identity mismatch.
 
 The script first asks AWS Secrets Manager for the mapped credential as the current IAM identity. It refuses to continue if the caller and stored identity do not match. It then runs this direct MongoDB operation from a disposable `mongosh` container:
 
@@ -420,20 +440,17 @@ The password exists transiently in the disposable container environment and is r
 
 The script also writes a non-secret start-time marker to `/tmp/mongodb-dam-direct-user-last-run-$UID`. The viewer uses it to avoid displaying stale activity from an earlier presentation. If the user and presenter terminals are on different machines, copy the printed epoch value and set `DIRECT_USER_NOT_BEFORE_EPOCH=<value>` before step 5.
 
-### Step 5 — display the attributed activity delivered by Outpost
+### Step 5 — display the attributed activity uploaded by Outpost
 
-Back in administrator terminal 2, keep `BEARER_TOKEN` loaded from `deploy/examples/secrets.local.env`, then run:
+Back in administrator terminal 2, run:
 
 ```bash
-export EXPECTED_KUBE_CONTEXT=<other-account-customer-demo-context>
-set -a
-source deploy/examples/secrets.local.env
-set +a
-
 ./scripts/show-direct-user-activity.sh
 ```
 
-The command waits for Observer → Outpost → configured demo receiver delivery and prints the newest matching `mongodb_activity`. Expected shape:
+The viewer loads the S3 destination and administrator `AWS_PROFILE` from `.env`.
+
+The command waits for Observer → Outpost → S3 delivery, downloads recent `.ndjson.gz` objects, and prints the newest matching `mongodb_activity`. Expected shape:
 
 ```json
 {
@@ -465,7 +482,7 @@ The command waits for Observer → Outpost → configured demo receiver delivery
 
 This output is the proof: the command came from the direct MongoDB user, Observer attributed it to the salted SCRAM principal, Outpost joined the protected IAM mapping and delivered it, and no query predicate or document body crossed the boundary. The IAM and secret ARNs shown here are inside the exported event so Collect can persist the actor and Rover can display and target the correct demo identity.
 
-The bundled receiver stands in for the configured regional ingress during this demo. Once the regional path exists, the same event flows through Collect and Sentinel can match a rule such as “successful multi-delete affecting at least 10 documents.” No rule, severity, finding, or blocking action is produced in this customer-side repository.
+The S3 object is the customer-to-regional handoff for this demo. Once Collect consumes that prefix, Sentinel can match a rule such as “successful multi-delete affecting at least 10 documents.” No rule, severity, finding, or blocking action is produced in this customer-side repository.
 
 ### Step 6 — Rover revokes future credential retrieval
 
@@ -482,7 +499,7 @@ There is deliberately no customer-side revoke HTTP endpoint and no IAM policy mu
 
 ### Step 7 — verify the IAM user was denied
 
-Keep the user-profile exports from step 4 and run:
+Run the verifier; it selects the direct-user profile or scoped keys from `.env`:
 
 ```bash
 ./scripts/verify-direct-user-secret-revoked.sh
@@ -508,7 +525,6 @@ This proves that Rover blocked new retrieval through the managed demo path. IAM 
 First use Rover to remove its demo inline deny policy. Then, in the administrator terminal, run the provisioner again to rotate the MongoDB password, refresh the secret and mapping, and restart Outpost:
 
 ```bash
-export AWS_PROFILE=dam-admin
 ./scripts/provision-direct-user.sh
 ```
 
@@ -535,7 +551,7 @@ After Collect persists the activity and Sentinel evaluates rules, the regional U
 - host I/O latency, page-fault, off-CPU, on-CPU, and lock-wait correlations;
 - Sentinel findings and cases joined back to the exact immutable source activity that caused each rule match.
 
-The bundled receiver is only an event viewer; it is not yet that dashboard. Durable regional storage, identity governance, Sentinel rules, alert state, case management, and the Collect HTTP-push path are the next-cell work.
+S3 is only the durable handoff; it is not yet that dashboard. Regional ingestion/checkpointing, identity governance, Sentinel rules, alert state, case management, and the Collect S3-consumer path are the next-cell work.
 
 ### Known MVP gaps in this exact storyline
 
@@ -547,3 +563,125 @@ The bundled receiver is only an event viewer; it is not yet that dashboard. Dura
 - Attribution is connection-scoped. A capture gap during SCRAM, unsupported TLS library, undecodable compression, or command metadata beyond the bounded prefix can produce activity without a principal.
 - An asynchronous eBPF sensor observes completed operations; inline prevention would require a separate synchronous enforcement point.
 - IAM denial blocks future Secrets Manager retrieval, not a previously copied password or already-open MongoDB session. The disposable demo client makes a new secret request for each operation.
+
+## Exact S3 output demo and JSON shape
+
+This is the final customer-side path now implemented:
+
+```text
+MongoDB -> Observer -> Outpost durable spool -> S3 .ndjson.gz -> future Collect consumer
+```
+
+Outpost writes one object per accepted batch. It uses a deterministic key so retries overwrite the same logical key:
+
+```text
+s3://<bucket>/<prefix>/customer_id=<customer>/tenant_id=<tenant>/regional_cell_id=<cell>/source_id=<source>/date=YYYY-MM-DD/hour=HH/<batch-id>.ndjson.gz
+```
+
+### 1. Configure and deploy to the other account
+
+Start with an existing bucket accessible to the demo-account credentials. The credentials used by Outpost need `s3:PutObject` on `<prefix>/*`; a bucket in another account also needs the corresponding bucket policy. For this disposable demo, local static administrator credentials are copied to a Kubernetes Secret; outside demoware, use a scoped EKS credential provider.
+
+```bash
+./scripts/generate-secrets.sh
+${EDITOR:-vi} .env
+./scripts/build-images.sh
+./scripts/deploy.sh
+./scripts/smoke-test.sh
+```
+
+Use the complete [.env.example](.env.example) as the field reference. For this path, fill `EXPECTED_KUBE_CONTEXT`, `REGISTRY`, `OUTPOST_S3_BUCKET`, the four assignment IDs, cluster name, an administrator profile or standard credentials, and the `OUTPOST_AWS_*` static credentials. Keep the generated defaults `DEMO_MODE=true`, `OUTPOST_DESTINATION=s3`, `OUTPOST_S3_PREFIX=mongodb-dam/events`, and `VALUES_FILE=deploy/examples/s3-demo-values.yaml` unless this demo needs different values.
+
+`OUTPOST_S3_BUCKET` and `OUTPOST_S3_PREFIX` become environment variables on the Outpost container. `AWS_REGION` and the normal AWS SDK credential chain provide S3 authentication inside that container. If the scoped static credential fields are blank, the deploy script does not create a credential Secret and Outpost can use EKS Pod Identity, IRSA, or another SDK provider.
+
+### 2. Generate MongoDB activity
+
+Keep the demo API forward running:
+
+```bash
+kubectl -n mongodb-dam port-forward service/mongodb-dam-demo-api 8080:8080
+```
+
+From another terminal, seed data and run the five API-driven operations:
+
+```bash
+curl --fail --silent --request POST http://127.0.0.1:8080/demo/seed | jq .
+curl --fail --silent --request POST http://127.0.0.1:8080/demo/workload | jq .
+```
+
+For the attributed IAM-user bulk-delete, follow steps 2–4 in [the direct MongoDB demo](#exact-aws-iam-user--direct-mongodb-activity-capture-demo), ending with `scripts/direct-user-bulk-delete.sh`.
+
+### 3. Prove Outpost captured and uploaded it
+
+Check Outpost's upload log:
+
+```bash
+kubectl -n mongodb-dam logs deployment/mongodb-dam-outpost --tail=100 \
+  | grep 'uploaded compressed DAM NDJSON batch'
+```
+
+Keep this metrics port-forward running in a separate terminal:
+
+```bash
+kubectl -n mongodb-dam port-forward service/mongodb-dam-outpost 8090:8090
+```
+
+Then read the counters from the administrator terminal:
+
+```bash
+curl --silent http://127.0.0.1:8090/metrics \
+  | grep -E '^mongodb_dam_outpost_(accepted_batches|delivered_batches|delivery_failures)_total '
+```
+
+List the newest uploaded objects:
+
+```bash
+# Raw AWS CLI commands do not auto-load the repository .env.
+set -a
+source .env
+set +a
+
+aws s3api list-objects-v2 \
+  --region "$AWS_REGION" \
+  --bucket "$OUTPOST_S3_BUCKET" \
+  --prefix "${OUTPOST_S3_PREFIX%/}/" \
+  --query 'reverse(sort_by(Contents,&LastModified))[:10].[LastModified,Key,Size]' \
+  --output table
+```
+
+Print recent MongoDB activities from the compressed objects:
+
+```bash
+EVENT_TYPE=mongodb_activity DATABASE=dam_demo ./scripts/show-s3-events.sh
+```
+
+For the IAM-mapped bulk-delete proof, run:
+
+```bash
+./scripts/show-direct-user-activity.sh
+```
+
+The actual object has `Content-Type: application/x-ndjson` and `Content-Encoding: gzip`. After decompression, each physical line is one compact, self-contained event. A bulk-delete line looks like this (wrapped here only for readability):
+
+```json
+{
+  "batch_schema_version": 1,
+  "batch_id": "batch-018f6f6e",
+  "batch_created_at": "2026-09-10T10:15:31Z",
+  "schema_version": 1,
+  "event_id": "event-delete-001",
+  "observed_at": "2026-09-10T10:15:30.412Z",
+  "monotonic_timestamp_ns": 481923410001,
+  "customer_id": "customer-demo",
+  "tenant_id": "tenant-demo",
+  "source_id": "mongodb-demo",
+  "regional_cell_id": "cell-ap-south-1",
+  "capture": {"sensor_id": "observer-ip-10-0-1-10", "node_name": "ip-10-0-1-10", "source": "cleartext_syscall", "confidence": "complete", "metadata_only": true, "truncated": false},
+  "kubernetes": {"cluster_name": "customer-demo-eks", "namespace": "mongodb-dam", "pod_name": "mongodb-dam-mongodb-0", "container_name": "mongodb"},
+  "identity": {"provider": "aws", "principal_type": "iam_user", "principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice", "account_id": "111122223333", "credential_source": "aws_secrets_manager", "credential_resource": "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam/demo/direct-user-AbCdEf"},
+  "event_type": "mongodb_activity",
+  "details": {"command": "delete", "database": "dam_demo", "collection": "customer_records", "principal": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "principal_hashed": true, "delete_scope": "multi", "delete_statements": 1, "affected_documents": 35, "request_id": 4321, "response_id": 4321, "request_bytes": 156, "response_bytes": 45, "duration_us": 1874, "succeeded": true, "expects_response": true, "compressed": false, "connection": {"connection_id": "8124:17", "fd": 17, "remote": {"address": "10.0.1.25", "port": 41862}, "tcp_srtt_us": 312, "retransmits": 0, "tls": false}}
+}
+```
+
+Schema-accurate examples for all eight payload types—`mongodb_activity`, `mongodb_auth`, `mongodb_connection`, `dns_activity`, `host_io`, `profile`, `process_lifecycle`, and `sensor_health`—are in [S3_NDJSON_EXAMPLES.md](docs/S3_NDJSON_EXAMPLES.md). Retry semantics, IAM permissions, and the complete object contract are in [S3_EXPORT_CONTRACT.md](docs/S3_EXPORT_CONTRACT.md).

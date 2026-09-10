@@ -13,12 +13,53 @@ verifier="$repo_root/scripts/verify-direct-user-secret-revoked.sh"
 mock_aws="$repo_root/tests/fixtures/mock-aws.sh"
 expected_principal='arn:aws:iam::111122223333:user/dam-demo-alice'
 output_file="$(mktemp)"
+profile_env="$(mktemp)"
 cleanup() {
-  rm -f -- "$output_file"
+  rm -f -- "$output_file" "$profile_env"
 }
 trap cleanup EXIT
 
+printf '%s\n' \
+  'AWS_REGION=ap-south-1' \
+  'DEMO_IAM_PRINCIPAL_ARN=arn:aws:iam::111122223333:user/dam-demo-alice' \
+  'DIRECT_USER_AWS_PROFILE=dam-user' \
+  'AWS_ACCESS_KEY_ID=demo-admin-access-key' \
+  'AWS_SECRET_ACCESS_KEY=demo-admin-secret-key' \
+  'AWS_SESSION_TOKEN=demo-admin-session-token' >"$profile_env"
+
 AWS_CLI_BIN="$mock_aws" \
+ENV_FILE="$profile_env" \
+MOCK_AWS_SECRET_RESULT=denied \
+MOCK_EXPECT_PROFILE=dam-user \
+MOCK_EXPECT_NO_STATIC_CREDENTIALS=true \
+  "$verifier" >"$output_file"
+jq -e --arg principal "$expected_principal" '
+  .status == "verified"
+  and .iam_principal_arn == $principal
+  and .secret_access == "denied"
+' "$output_file" >/dev/null
+
+printf '%s\n' \
+  'AWS_REGION=ap-south-1' \
+  'DEMO_IAM_PRINCIPAL_ARN=arn:aws:iam::111122223333:user/dam-demo-alice' \
+  'AWS_ACCESS_KEY_ID=demo-admin-access-key' \
+  'AWS_SECRET_ACCESS_KEY=demo-admin-secret-key' \
+  'DIRECT_USER_AWS_PROFILE=' \
+  'DIRECT_USER_AWS_ACCESS_KEY_ID=demo-user-access-key' \
+  'DIRECT_USER_AWS_SECRET_ACCESS_KEY=demo-user-secret-key' \
+  'DIRECT_USER_AWS_SESSION_TOKEN=demo-user-session-token' >"$profile_env"
+
+AWS_CLI_BIN="$mock_aws" \
+ENV_FILE="$profile_env" \
+MOCK_AWS_SECRET_RESULT=denied \
+MOCK_EXPECT_ACCESS_KEY_ID=demo-user-access-key \
+MOCK_EXPECT_SESSION_TOKEN=demo-user-session-token \
+  "$verifier" >"$output_file"
+jq -e '.status == "verified" and .secret_access == "denied"' \
+  "$output_file" >/dev/null
+
+AWS_CLI_BIN="$mock_aws" \
+ENV_FILE=/dev/null \
 AWS_REGION=ap-south-1 \
 DEMO_IAM_PRINCIPAL_ARN="$expected_principal" \
 MOCK_AWS_SECRET_RESULT=denied \
@@ -31,6 +72,7 @@ jq -e --arg principal "$expected_principal" '
 ' "$output_file" >/dev/null
 
 if AWS_CLI_BIN="$mock_aws" \
+  ENV_FILE=/dev/null \
   AWS_REGION=ap-south-1 \
   DEMO_IAM_PRINCIPAL_ARN="$expected_principal" \
   MOCK_AWS_SECRET_RESULT=allowed \
@@ -40,6 +82,7 @@ if AWS_CLI_BIN="$mock_aws" \
 fi
 
 if AWS_CLI_BIN="$mock_aws" \
+  ENV_FILE=/dev/null \
   AWS_REGION=ap-south-1 \
   DEMO_IAM_PRINCIPAL_ARN="$expected_principal" \
   MOCK_AWS_CALLER_ARN='arn:aws:iam::111122223333:user/not-the-demo-user' \
@@ -50,6 +93,7 @@ if AWS_CLI_BIN="$mock_aws" \
 fi
 
 if AWS_CLI_BIN="$mock_aws" \
+  ENV_FILE=/dev/null \
   AWS_REGION=ap-south-1 \
   DEMO_IAM_PRINCIPAL_ARN="$expected_principal" \
   MOCK_AWS_SECRET_RESULT=error \

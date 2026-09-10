@@ -9,6 +9,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bpf ./bpf
+COPY tests ./tests
+COPY docs ./docs
 RUN --mount=type=cache,id=mongodb-dam-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=mongodb-dam-observer-target,target=/src/target \
     cargo build --locked --release --bin observer \

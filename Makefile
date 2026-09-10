@@ -1,4 +1,4 @@
-.PHONY: check test test-container test-http-push test-ebpf test-demo-api test-secret-access build-images lint-chart render-chart
+.PHONY: check test test-container test-env test-http-push test-ebpf test-demo-api test-secret-access build-images lint-chart render-chart
 
 check:
 	cargo check --workspace --locked
@@ -8,6 +8,9 @@ test:
 
 test-container:
 	docker build --file Dockerfile.observer --target test .
+
+test-env:
+	./scripts/test-env.sh
 
 test-http-push:
 	./scripts/test-http-push.sh

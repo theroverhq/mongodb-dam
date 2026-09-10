@@ -1,6 +1,8 @@
 # DAM demo walkthrough
 
-This mode is disposable presentation infrastructure. It adds:
+This page documents the bundled local HTTP-receiver variant of the disposable presentation. The primary cross-account demo now uploads gzip NDJSON to S3 and is documented step by step in [the README](../README.md#exact-s3-output-demo-and-json-shape).
+
+This local variant adds:
 
 - a constrained HTTP API that uses the official PyMongo driver to query MongoDB;
 - the normal node-local Observer and Outpost pipeline;
@@ -10,44 +12,33 @@ MongoDB Community does not provide a general-purpose REST query API. The bundled
 
 ## Deploy demo mode
 
-Run all commands from the repository root. Build and push all four demo images from your local machine:
-
-```bash
-export REGISTRY=111122223333.dkr.ecr.ap-south-1.amazonaws.com
-export TAG=v0.1.0-demo
-
-BUILD_DEMO=true PUSH_IMAGES=true ./scripts/build-images.sh
-```
-
-Generate and load local secrets if you have not already done so:
+Run all commands from the repository root. Generate the complete local configuration if it does not exist:
 
 ```bash
 ./scripts/generate-secrets.sh
-set -a
-source deploy/examples/secrets.local.env
-set +a
+${EDITOR:-vi} .env
 ```
 
-Deploy only after selecting the other-account Kubernetes context deliberately:
+For this local HTTP-receiver variant, set these values in `.env` in addition to the assignment and registry fields:
+
+```dotenv
+EXPECTED_KUBE_CONTEXT=customer-demo
+OUTPOST_DESTINATION=http
+DEMO_MODE=true
+ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam
+VALUES_FILE=deploy/examples/demo-values.yaml
+BUILD_DEMO=true
+PUSH_IMAGES=true
+```
+
+Build and push all four demo images, then deploy only after selecting the other-account Kubernetes context deliberately:
 
 ```bash
-export EXPECTED_KUBE_CONTEXT=customer-demo
-export CUSTOMER_ID=customer-demo
-export TENANT_ID=tenant-demo
-export SOURCE_ID=mongodb-demo
-export REGIONAL_CELL_ID=cell-demo
-export CLUSTER_NAME=customer-demo-cluster
-
-export DEMO_MODE=true
-export ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam
-export VALUES_FILE=deploy/examples/demo-values.yaml
-export OBSERVER_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-observer"
-export OUTPOST_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-outpost"
-export DEMO_API_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-demo-api"
-export DEMO_RECEIVER_IMAGE_REPOSITORY="$REGISTRY/mongodb-dam-mock-endpoint"
-
+./scripts/build-images.sh
 ./scripts/deploy.sh
 ```
+
+Every repository entry-point script loads root `.env` automatically. `REGISTRY` is also used to derive all four image repositories unless an explicit repository override is set.
 
 The deploy script accepts that cleartext endpoint only when `DEMO_MODE=true` and only for the exact in-cluster hostname `mock-endpoint`. All other non-HTTPS destinations remain rejected.
 
@@ -131,6 +122,10 @@ kubectl -n mongodb-dam port-forward service/mock-endpoint 8088:8088
 Read the most recent delivered batches using the same bearer token configured on Outpost:
 
 ```bash
+set -a
+source .env
+set +a
+
 curl --fail --silent \
   --header "authorization: Bearer $BEARER_TOKEN" \
   'http://127.0.0.1:8088/v1/batches?limit=250' \
@@ -153,8 +148,6 @@ You should see `find`, `insert`, `update`, `aggregate`, and `delete`. You should
 To show the complete three-step flow and counters automatically:
 
 ```bash
-EXPECTED_KUBE_CONTEXT=customer-demo \
-BEARER_TOKEN="$BEARER_TOKEN" \
 ./scripts/run-demo.sh
 ```
 
@@ -166,7 +159,7 @@ The final command prints:
 - Observer capture/delivery counters from the MongoDB node;
 - Outpost accepted/delivered/failure counters.
 
-The demo receiver retains only the latest configured number of batches in memory. Restarting its pod clears the presentation history; it is not the regional product datastore.
+The demo receiver retains only the latest configured number of batches in memory. Restarting its pod clears the presentation history; it is not the regional product datastore. In S3 mode the chart omits this receiver entirely.
 
 ## Troubleshooting
 

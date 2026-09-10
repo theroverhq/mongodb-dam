@@ -9,9 +9,14 @@ Verify the rollout:
   kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "mongodb-dam.fullname" . }}-mongodb
 
 Observer needs privileged pods, host PID access, BTF, and tracefs on every selected Linux node.
-Outpost sends metadata batches only to:
+{{- if eq (lower .Values.destination.mode) "s3" }}
+Outpost uploads gzip-compressed NDJSON to:
+  s3://{{ .Values.destination.s3.bucket }}/{{ trimAll "/" .Values.destination.s3.prefix }}/
+{{- else }}
+Outpost sends metadata batches over HTTP only to:
   {{ .Values.destination.endpoint }}
-{{- if .Values.demo.enabled }}
+{{- end }}
+{{- if and .Values.demo.enabled (eq (lower .Values.destination.mode) "http") }}
 
 Demo mode is enabled. Run the complete presentation flow locally:
   EXPECTED_KUBE_CONTEXT='<current demo kubecontext>' BEARER_TOKEN='<configured token>' ./scripts/run-demo.sh
