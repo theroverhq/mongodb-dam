@@ -108,6 +108,7 @@ Run the full Rust/eBPF build-time suite and the disposable Outpost contract test
 make test-container
 make test-env
 make test-http-push
+make test-direct-user-api
 make test-secret-access
 ```
 
@@ -178,6 +179,7 @@ To retain the old local HTTP receiver path, set `OUTPOST_DESTINATION=http`, `END
 - `crates/schema/`: the only serializable data model allowed out of the customer node.
 - `crates/mock-endpoint/`: local stand-in for the optional HTTP destination.
 - `demo/api/`: disposable HTTP application that creates visible MongoDB activity.
+- `demo/client-api/`: loopback-only gateway that turns curl requests on the AWS-logged user machine into direct, IAM-mapped MongoDB operations.
 - `deploy/helm/mongodb-dam/`: single Helm chart for the customer cluster.
 - `scripts/`: local build, preflight, deployment, and smoke-test entry points.
 
@@ -255,23 +257,24 @@ It should show `find`, `insert`, `update`, `aggregate`, and `delete`, without qu
 
 The implementation is in [run-demo.sh](scripts/run-demo.sh), and the demo Kubernetes components are in [demo.yaml](deploy/helm/mongodb-dam/templates/demo.yaml).
 
-The repository includes Rust tests, strict Clippy checks, Helm lint/render checks, demo API integration, mocked Secrets Manager denial verification, HTTP compatibility tests, an S3 upload test, and a privileged live eBPF test covering SCRAM attribution, a captured 35-document bulk delete, IAM enrichment, TCP lifecycle telemetry, and clear-value redaction. The live test uses MongoDB Community 7 on hosts whose kernel cannot run MongoDB 8; the chart remains pinned to Community 8 for supported cluster kernels.
+The repository includes Rust tests, strict Clippy checks, Helm lint/render checks, demo API integration, lightweight client-gateway identity tests, mocked Secrets Manager denial verification, HTTP compatibility tests, an S3 upload test, and a privileged live eBPF test covering SCRAM attribution, a captured 35-document bulk delete, IAM enrichment, TCP lifecycle telemetry, and clear-value redaction. The live test uses MongoDB Community 7 on hosts whose kernel cannot run MongoDB 8; the chart remains pinned to Community 8 for supported cluster kernels.
 
 ## Exact AWS IAM user → direct MongoDB activity capture demo
 
-This is the end-to-end capture storyline for the MVP. It does not call the demo REST API for the destructive action. A `mongosh` client connects directly to MongoDB, authenticates as a dedicated database user, executes `deleteMany`, and produces an attributed activity event that Observer sends through Outpost to S3. This repository does not decide whether that activity is malicious; Collect and Sentinel will do that after the regional cell consumes the S3 export.
+This is the end-to-end capture storyline for the MVP. Every presented database operation is initiated with curl. Curl cannot speak the MongoDB wire protocol, so a loopback-only gateway runs on the same AWS-logged client machine. For every HTTP request, it verifies the current AWS caller, retrieves that caller's mapped SCRAM credential from Secrets Manager, and launches a direct `mongosh` connection to MongoDB. The shared in-cluster demo API is used only to seed/reset deterministic data. This repository does not decide whether activity is malicious; Collect and Sentinel do that after the regional cell consumes the S3 export.
 
 ### Read this identity boundary first
 
 MongoDB Community does **not** support native `MONGODB-AWS` authentication; [MongoDB documents that mechanism as Atlas-only](https://www.mongodb.com/docs/drivers/rust/current/security/authentication/aws-iam/). Community supports SCRAM authentication, as described in MongoDB's [security checklist](https://www.mongodb.com/docs/manual/administration/security-checklist/). Atlas database nodes cannot run this Observer because customers do not control those hosts. This demo therefore uses the following combination:
 
 ```text
-AWS IAM user
-    └── authorized by AWS to read one Secrets Manager secret
-          └── secret maps IAM ARN to one MongoDB SCRAM user
-                └── mongosh connects directly to MongoDB
-                      └── Observer hashes the SCRAM username and attributes commands
-                            └── Outpost joins the protected IAM mapping and uploads gzip NDJSON to S3
+curl on the AWS-logged user machine
+    └── loopback gateway (127.0.0.1 only)
+          └── current AWS identity reads one Secrets Manager secret
+                └── secret maps IAM ARN to one MongoDB SCRAM user
+                      └── mongosh connects directly to MongoDB
+                            └── Observer hashes the SCRAM username and attributes commands
+                                  └── Outpost enriches and uploads gzip NDJSON to S3
 ```
 
 AWS IAM is the gate for obtaining the database credential; MongoDB Community performs SCRAM-SHA-256 authentication. The clear IAM ARN and Secrets Manager ARN are stored in a protected, demo-only Kubernetes Secret mounted only into Outpost. Outpost performs the trusted join and exports those identifiers as metadata. Passwords, AWS credentials, delete filters, and document bodies are not exported.
@@ -281,7 +284,7 @@ In the MongoDB wire command, [`limit: 0` identifies a multi-delete and response 
 ### What this flow demonstrates
 
 - AWS authorizes a named IAM principal to retrieve exactly one demo database credential.
-- That identity uses `mongosh` directly; the destructive query does not pass through the REST API.
+- Every workload action shown by the presenter is a curl command to a gateway on the user's own machine; the gateway opens the direct `mongosh` connection as that mapped user.
 - Observer correlates the SCRAM exchange to the same physical MongoDB connection.
 - The exported `mongodb_activity` contains the IAM user ARN, AWS account ID, credential-secret ARN, salted MongoDB principal hash, `delete_scope=multi`, and `affected_documents=35`.
 - Outpost receives that activity, replaces any untrusted incoming identity with its protected mapping, adds available Kubernetes metadata, and uploads it under the exact configured S3 bucket and prefix.
@@ -294,11 +297,12 @@ Use the separate customer/demo AWS account and cluster, not the Foundry/current 
 - the S3 demo deployment from this repository and access to read its configured prefix;
 - an AWS administrator profile that can manage one Secrets Manager secret;
 - an existing same-account IAM user for the simulated database user;
-- a second AWS CLI profile that actually assumes/uses that IAM identity;
-- `aws`, `docker`, `kubectl`, `jq`, `openssl`, `sha256sum`, and `base64` on a Linux client;
+- a second AWS CLI profile or static key set that actually uses that IAM identity;
+- `aws`, `curl`, `kubectl`, `python3`, `jq`, `openssl`, `sha256sum`, and `base64` on a Linux client;
+- either a local `mongosh` executable or Docker for the fallback disposable MongoDB client;
 - the local secret environment produced by `scripts/generate-secrets.sh`.
 
-The direct-client scripts use Docker host networking. Run them on Linux. AWS documents how a [resource-based policy can grant a principal access to one secret](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_resource-policies.html) and that [an explicit deny overrides an allow](https://docs.aws.amazon.com/secretsmanager/latest/userguide/determine-acccess_examine-iam-policies.html). Therefore, if an Organizations SCP, permissions boundary, or another policy explicitly denies `secretsmanager:GetSecretValue`, the resource policy created by the provisioner cannot override it.
+The gateway prefers a local `mongosh`. If it is unavailable, it runs the configured MongoDB client image with Docker host networking; that fallback requires Linux. AWS documents how a [resource-based policy can grant a principal access to one secret](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_resource-policies.html) and that [an explicit deny overrides an allow](https://docs.aws.amazon.com/secretsmanager/latest/userguide/determine-acccess_examine-iam-policies.html). Therefore, if an Organizations SCP, permissions boundary, or another policy explicitly denies `secretsmanager:GetSecretValue`, the resource policy created by the provisioner cannot override it.
 
 ### Step 0 — build and deploy demo mode in the other account
 
@@ -396,27 +400,83 @@ Use the same profile name in `DIRECT_USER_AWS_PROFILE` in `.env`, or fill the sc
 
 Do not continue unless this is the intended demo user. If `GetSecretValue` is denied despite the secret resource policy, check that identity's permissions boundary and your Organizations SCPs for an explicit deny.
 
-### Step 3 — open the direct MongoDB tunnel as the presenter
+### Step 3 — start the AWS-user curl gateway
 
-Keep this running in administrator terminal 3:
-
-```bash
-kubectl -n mongodb-dam port-forward service/mongodb-dam-mongodb 27018:27017
-```
-
-This keeps MongoDB private; it does not expose a public LoadBalancer. The next command is still a direct MongoDB wire-protocol connection from `mongosh`, not an API call.
-
-### Step 4 — run the bulk delete as the IAM-mapped user
-
-Open the simulated user's terminal and run:
+On the AWS-logged simulated-user machine, keep this running:
 
 ```bash
-./scripts/direct-user-bulk-delete.sh
+./scripts/run-direct-user-api.sh
 ```
 
-The script loads the region, expected context, principal ARN, secret ID, tunnel port, and direct-user AWS profile or keys from `.env`. It prints the resolved AWS caller before opening the direct MongoDB connection and refuses an identity mismatch.
+The launcher loads `.env`, switches explicitly to `DIRECT_USER_AWS_PROFILE` or the scoped `DIRECT_USER_AWS_*` keys, verifies that the resolved caller equals `DEMO_IAM_PRINCIPAL_ARN`, and opens the private Kubernetes tunnel to MongoDB. It then listens only on `127.0.0.1:18082`. It never accepts a caller ARN from an HTTP header or request body.
 
-The script first asks AWS Secrets Manager for the mapped credential as the current IAM identity. It refuses to continue if the caller and stored identity do not match. It then runs this direct MongoDB operation from a disposable `mongosh` container:
+The gateway performs a new STS identity check and Secrets Manager lookup for every request. It does not cache the MongoDB password. A successful request starts a short direct `mongosh` connection authenticated as the mapped SCRAM user, so Observer sees that user's authentication and command rather than the shared in-cluster API identity.
+
+### Step 4 — run all database queries with curl
+
+In another terminal on the same machine, first prove the mapped credential can connect:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  http://127.0.0.1:18082/v1/access-check | jq .
+```
+
+Run a direct find:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  'http://127.0.0.1:18082/v1/customers?email=aarav%40example.test' | jq .
+```
+
+Run insert, update, aggregate, and single-delete operations:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --request POST \
+  --header 'content-type: application/json' \
+  --data '{"order_id":"iam-order-001","customer_id":"cust-001","product":"iam-curl-demo","amount":42.50}' \
+  http://127.0.0.1:18082/v1/orders | jq .
+
+curl --fail-with-body --silent --show-error \
+  --request PATCH \
+  --header 'content-type: application/json' \
+  --data '{"status":"paid"}' \
+  http://127.0.0.1:18082/v1/orders/iam-order-001 | jq .
+
+curl --fail-with-body --silent --show-error \
+  http://127.0.0.1:18082/v1/analytics/revenue-by-status | jq .
+
+curl --fail-with-body --silent --show-error \
+  --request DELETE \
+  http://127.0.0.1:18082/v1/orders/iam-order-001 | jq .
+```
+
+Finally, run the 35-record mischief operation:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  --request DELETE \
+  'http://127.0.0.1:18082/v1/customer-records?demo_batch=iam-bulk-delete' | jq .
+```
+
+Expected shape:
+
+```json
+{
+  "iam_principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice",
+  "database": "dam_demo",
+  "result": {
+    "command": "delete",
+    "collection": "customer_records",
+    "delete_scope": "multi",
+    "matching_before_delete": 35,
+    "deleted_count": 35
+  },
+  "activity_not_before_epoch": 1789021800
+}
+```
+
+Behind the loopback gateway, that final curl causes this fixed MongoDB operation:
 
 ```javascript
 db.getSiblingDB("dam_demo")
@@ -424,21 +484,7 @@ db.getSiblingDB("dam_demo")
   .deleteMany({demo_batch: "iam-bulk-delete"})
 ```
 
-Expected result:
-
-```json
-{
-  "command": "deleteMany",
-  "database": "dam_demo",
-  "collection": "customer_records",
-  "matchingBeforeDelete": 35,
-  "deletedCount": 35
-}
-```
-
-The password exists transiently in the disposable container environment and is removed with that container. This handling is suitable for demoware, not production credential delivery.
-
-The script also writes a non-secret start-time marker to `/tmp/mongodb-dam-direct-user-last-run-$UID`. The viewer uses it to avoid displaying stale activity from an earlier presentation. If the user and presenter terminals are on different machines, copy the printed epoch value and set `DIRECT_USER_NOT_BEFORE_EPOCH=<value>` before step 5.
+The gateway writes the non-secret `activity_not_before_epoch` to `/tmp/mongodb-dam-direct-user-last-run-$UID`. The S3 viewer uses it to avoid displaying stale activity. If the gateway and administrator viewer run on different machines, copy the returned number into `DIRECT_USER_NOT_BEFORE_EPOCH` in the administrator's `.env`. `scripts/direct-user-bulk-delete.sh` remains only as a convenience wrapper around the exact bulk-delete curl command; it no longer accesses AWS or MongoDB itself.
 
 ### Step 5 — display the attributed activity uploaded by Outpost
 
@@ -448,7 +494,7 @@ Back in administrator terminal 2, run:
 ./scripts/show-direct-user-activity.sh
 ```
 
-The viewer loads the S3 destination and administrator `AWS_PROFILE` from `.env`.
+The viewer loads the S3 destination and administrator AWS profile or keys from `.env`.
 
 The command waits for Observer → Outpost → S3 delivery, downloads recent `.ndjson.gz` objects, and prints the newest matching `mongodb_activity`. Expected shape:
 
@@ -499,26 +545,27 @@ There is deliberately no customer-side revoke HTTP endpoint and no IAM policy mu
 
 ### Step 7 — verify the IAM user was denied
 
-Run the verifier; it selects the direct-user profile or scoped keys from `.env`:
+From the curl terminal, retry the access check:
 
 ```bash
-./scripts/verify-direct-user-secret-revoked.sh
+curl --silent --show-error --include \
+  http://127.0.0.1:18082/v1/access-check
 ```
 
 Expected result:
 
-```json
-{
-  "status": "verified",
-  "iam_principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice",
-  "aws_secret_id": "mongodb-dam/demo/direct-user",
-  "secret_access": "denied"
-}
+```text
+HTTP/1.1 403 Forbidden
+content-type: application/json
+
+{"error":"secret_access_denied","message":"the current AWS identity cannot retrieve the MongoDB credential"}
 ```
 
-The verifier requests only the secret ARN from AWS CLI output, never the secret value. It succeeds only for the expected IAM caller and an `AccessDenied` result; a reachable secret or unrelated AWS failure makes the verification fail. Running `direct-user-bulk-delete.sh` again now also stops at `GetSecretValue` before opening a new MongoDB connection.
+The gateway performs this Secrets Manager request again for every curl. On denial it returns `403` before launching `mongosh`, so no new MongoDB session or query occurs. For an independent CLI assertion, `./scripts/verify-direct-user-secret-revoked.sh` remains available; it requests only the secret ARN and never the secret value.
 
-This proves that Rover blocked new retrieval through the managed demo path. IAM cannot erase a password that was already copied or terminate an already-open MongoDB session. The demo intentionally uses a fresh Secrets Manager lookup and a disposable `mongosh` container for every operation.
+AWS IAM policy changes are eventually consistent. If the first request immediately after Rover's action still succeeds, wait a few seconds and retry the same curl until it returns the expected `403`.
+
+This proves that Rover blocked new retrieval through the managed demo path. IAM cannot erase a password copied by another client or terminate an already-open MongoDB session. This gateway deliberately discards the password and closes `mongosh` after every request, making every subsequent curl depend on a fresh allowed Secrets Manager lookup.
 
 ### Step 8 — reset and repeat the presentation
 
@@ -535,7 +582,7 @@ curl --fail --silent --show-error \
   --request POST http://127.0.0.1:8080/demo/seed | jq .
 ```
 
-Repeat steps 4 through 7. Resetting Rover's deny is intentionally not automated here because AWS response ownership belongs to Rover.
+The running gateway fetches the rotated value on its next request, so it does not need a restart. Repeat steps 4 through 7. Resetting Rover's deny is intentionally not automated here because AWS response ownership belongs to Rover.
 
 ### DAM dashboard views supported by this telemetry
 
@@ -559,10 +606,11 @@ S3 is only the durable handoff; it is not yet that dashboard. Regional ingestion
 - Observer and Outpost intentionally perform capture and transport only. Detection and response wait for Collect/Sentinel integration.
 - The opt-in demo exports clear IAM and Secrets Manager ARNs. A production design needs a secure identity registry, explicit data-governance approval, and an audited mapping lifecycle.
 - The provisioner supports a same-account IAM principal. Cross-account Secrets Manager access needs a customer-managed KMS key and additional key/resource policies.
-- `mongosh` runs in a short-lived Docker container and uses a presenter-owned Kubernetes port-forward. This avoids exposing MongoDB publicly but is not a production access architecture.
+- The loopback gateway launches a short-lived local `mongosh` process, or a Docker client fallback, through a presenter-owned Kubernetes port-forward. This avoids exposing MongoDB publicly but is not a production access architecture.
+- The curl gateway is deliberately demoware: it binds only to loopback and exposes only fixed demo operations, but it has no separate HTTP authentication. Do not bind it to a non-loopback interface.
 - Attribution is connection-scoped. A capture gap during SCRAM, unsupported TLS library, undecodable compression, or command metadata beyond the bounded prefix can produce activity without a principal.
 - An asynchronous eBPF sensor observes completed operations; inline prevention would require a separate synchronous enforcement point.
-- IAM denial blocks future Secrets Manager retrieval, not a previously copied password or already-open MongoDB session. The disposable demo client makes a new secret request for each operation.
+- IAM denial blocks future Secrets Manager retrieval, not a previously copied password or already-open MongoDB session. The loopback gateway intentionally makes a new secret request and a new short-lived MongoDB connection for every curl operation.
 
 ## Exact S3 output demo and JSON shape
 
@@ -609,7 +657,7 @@ curl --fail --silent --request POST http://127.0.0.1:8080/demo/seed | jq .
 curl --fail --silent --request POST http://127.0.0.1:8080/demo/workload | jq .
 ```
 
-For the attributed IAM-user bulk-delete, follow steps 2–4 in [the direct MongoDB demo](#exact-aws-iam-user--direct-mongodb-activity-capture-demo), ending with `scripts/direct-user-bulk-delete.sh`.
+For the attributed IAM-user bulk-delete, follow steps 2–4 in [the direct MongoDB demo](#exact-aws-iam-user--direct-mongodb-activity-capture-demo), ending with the curl `DELETE /v1/customer-records` request.
 
 ### 3. Prove Outpost captured and uploaded it
 

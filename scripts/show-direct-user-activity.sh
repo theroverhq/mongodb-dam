@@ -52,7 +52,7 @@ run_marker_file="${DIRECT_USER_RUN_MARKER_FILE:-/tmp/mongodb-dam-direct-user-las
 not_before_epoch="${DIRECT_USER_NOT_BEFORE_EPOCH:-}"
 if [[ -z "$not_before_epoch" ]]; then
   if [[ ! -f "$run_marker_file" ]]; then
-    printf 'Run marker not found: %s. Run direct-user-bulk-delete.sh first or set DIRECT_USER_NOT_BEFORE_EPOCH.\n' \
+    printf 'Run marker not found: %s. Run the direct-user bulk-delete curl first or set DIRECT_USER_NOT_BEFORE_EPOCH.\n' \
       "$run_marker_file" >&2
     exit 1
   fi

@@ -65,7 +65,7 @@ Expected summary:
 
 The dummy values use the reserved `.test` domain and are not real customer data.
 
-For the AWS IAM-mapped direct `mongosh` scenario and proof that its attributed bulk-delete activity reached the Outpost destination, follow the complete final section of the repository [README](../README.md#exact-aws-iam-user--direct-mongodb-activity-capture-demo).
+For the AWS IAM-mapped curl scenario and proof that its attributed bulk-delete activity reached the Outpost destination, follow the complete final section of the repository [README](../README.md#exact-aws-iam-user--direct-mongodb-activity-capture-demo). Its loopback gateway uses the AWS login on the client machine and opens the direct `mongosh` connection behind each curl request.
 
 ## 2. Execute queries over HTTP from the client machine
 
