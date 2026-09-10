@@ -83,6 +83,7 @@ observer:
   batchMaxEvents: 200
   batchFlushMilliseconds: 1000
   enabledEventTypes: all
+  enabledMongodbCommands: all
   spoolMaxBytes: 268435456
   spoolHostPath: /var/lib/mongodb-dam/observer
   resources:

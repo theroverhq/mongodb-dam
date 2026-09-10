@@ -89,6 +89,7 @@ For the query-only demo, keep these values in `.env`. If `.env` already exists, 
 
 ```dotenv
 OBSERVER_ENABLED_EVENT_TYPES=mongodb_activity
+OBSERVER_ENABLED_MONGODB_COMMANDS=find,aggregate,insert,update,delete
 OBSERVER_BATCH_FLUSH_MILLISECONDS=60000
 OBSERVER_BATCH_MAX_EVENTS=10000
 OUTPOST_EXPORT_INTERVAL_SECONDS=60
@@ -97,12 +98,14 @@ OBSERVER_LOCK_PROFILING=false
 OBSERVER_TLS_UPROBES=off
 ```
 
-This creates one query-only Observer batch every 60 seconds under normal demo volume, which becomes one gzip NDJSON object in S3. Empty minutes create no object. The high batch limit prevents the small demo workload from flushing early. CPU sampling, lock profiling, and unused TLS uprobes are disabled for this cleartext MongoDB demo. Authentication and connection events are still processed internally because they are required to associate a MongoDB command with its SCRAM user, but only `mongodb_activity` crosses the Observer-to-Outpost boundary. To restore every telemetry type, set `OBSERVER_ENABLED_EVENT_TYPES=all`; to change the cadence, change the millisecond flush value. Rebuild the Observer image and redeploy after changing these values:
+This creates one query-only Observer batch every 60 seconds under normal demo volume, which becomes one gzip NDJSON object in S3. Empty minutes create no object. The command allowlist drops health checks and driver maintenance commands such as `ping`, `hello`, and `isMaster`; only `find`, `aggregate`, `insert`, `update`, and `delete` activities are exported. The high batch limit prevents the small demo workload from flushing early. CPU sampling, lock profiling, and unused TLS uprobes are disabled for this cleartext MongoDB demo. Authentication and connection events are still processed internally because they are required to associate a MongoDB command with its SCRAM user, but only allowed `mongodb_activity` records cross the Observer-to-Outpost boundary. To restore every MongoDB command, set `OBSERVER_ENABLED_MONGODB_COMMANDS=all`; to restore every telemetry type, also set `OBSERVER_ENABLED_EVENT_TYPES=all`. To change the cadence, change the millisecond flush value. Rebuild the Observer image and redeploy after changing these values:
 
 ```bash
 ./scripts/build-images.sh
 ./scripts/deploy.sh
 ```
+
+The filter applies to newly observed activity; it does not remove objects already present in S3. Use a fresh `OUTPOST_S3_PREFIX` if you want a clean demo view without earlier `ping` objects.
 
 An explicitly supplied variable wins over the value in `.env`, so a safe one-command override remains possible:
 

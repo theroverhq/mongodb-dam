@@ -94,6 +94,8 @@ struct Cli {
     batch_max_events: usize,
     #[arg(long, env = "OBSERVER_ENABLED_EVENT_TYPES", default_value = "all")]
     enabled_event_types: String,
+    #[arg(long, env = "OBSERVER_ENABLED_MONGODB_COMMANDS", default_value = "all")]
+    enabled_mongodb_commands: String,
     #[arg(
         long,
         env = "OBSERVER_BATCH_FLUSH_MILLISECONDS",
@@ -182,6 +184,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
     let enabled_event_types = parse_enabled_event_types(&cli.enabled_event_types)?;
+    let enabled_mongodb_commands = parse_enabled_mongodb_commands(&cli.enabled_mongodb_commands)?;
     let emit_sensor_health = event_type_is_enabled(&enabled_event_types, "sensor_health");
 
     let sensor_id = cli
@@ -229,15 +232,17 @@ async fn main() -> Result<()> {
         principal_hash_salt,
     };
     let processor_enabled_event_types = enabled_event_types.clone();
+    let processor_enabled_mongodb_commands = enabled_mongodb_commands.clone();
     let processor_task = tokio::spawn(async move {
         let mut processor = EventProcessor::new(processor_config);
         while let Some(captured) = kernel_rx.recv().await {
             match processor.process(captured) {
                 Ok(events) => {
                     for event in events {
-                        if !event_type_is_enabled(
+                        if !event_is_enabled(
                             &processor_enabled_event_types,
-                            event_type_name(&event.payload),
+                            &processor_enabled_mongodb_commands,
+                            &event.payload,
                         ) {
                             continue;
                         }
@@ -394,6 +399,49 @@ fn event_type_is_enabled(enabled: &Option<HashSet<String>>, event_type: &str) ->
     enabled
         .as_ref()
         .is_none_or(|event_types| event_types.contains(event_type))
+}
+
+fn parse_enabled_mongodb_commands(raw: &str) -> Result<Option<HashSet<String>>> {
+    let selected = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        !selected.is_empty(),
+        "enabled_mongodb_commands must contain all or at least one command"
+    );
+    if selected.contains("all") {
+        anyhow::ensure!(
+            selected.len() == 1,
+            "enabled_mongodb_commands cannot combine all with named commands"
+        );
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        selected.iter().all(|command| command
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')),
+        "enabled_mongodb_commands contains an invalid command name"
+    );
+    Ok(Some(selected))
+}
+
+fn event_is_enabled(
+    enabled_event_types: &Option<HashSet<String>>,
+    enabled_mongodb_commands: &Option<HashSet<String>>,
+    payload: &EventPayload,
+) -> bool {
+    if !event_type_is_enabled(enabled_event_types, event_type_name(payload)) {
+        return false;
+    }
+    match payload {
+        EventPayload::MongodbActivity(activity) => enabled_mongodb_commands
+            .as_ref()
+            .is_none_or(|commands| commands.contains(&activity.command.to_ascii_lowercase())),
+        _ => true,
+    }
 }
 
 fn event_type_name(payload: &EventPayload) -> &'static str {

@@ -132,6 +132,16 @@ if [[ -n "${OBSERVER_ENABLED_EVENT_TYPES:-}" ]]; then
     exit 1
   fi
 fi
+if [[ -n "${OBSERVER_ENABLED_MONGODB_COMMANDS:-}" \
+  && ! "${OBSERVER_ENABLED_MONGODB_COMMANDS}" =~ ^[a-z][a-z0-9_]*(,[a-z][a-z0-9_]*)*$ ]]; then
+  printf '%s\n' 'OBSERVER_ENABLED_MONGODB_COMMANDS must be all or a comma-separated lowercase command list.' >&2
+  exit 1
+fi
+if [[ "${OBSERVER_ENABLED_MONGODB_COMMANDS:-}" == *all* \
+  && "${OBSERVER_ENABLED_MONGODB_COMMANDS}" != all ]]; then
+  printf '%s\n' 'OBSERVER_ENABLED_MONGODB_COMMANDS cannot combine all with named commands.' >&2
+  exit 1
+fi
 if [[ "$demo_mode" == "true" \
   && ! "${DIRECT_USER_MAPPING_KEY:-identity-mapping.json}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   printf '%s\n' 'DIRECT_USER_MAPPING_KEY must be a single Kubernetes Secret data key.' >&2
@@ -252,7 +262,12 @@ helm_args=(
   --set-string "images.outpost.tag=$tag"
 )
 if [[ -n "${OBSERVER_ENABLED_EVENT_TYPES:-}" ]]; then
-  helm_args+=(--set-string "observer.enabledEventTypes=$OBSERVER_ENABLED_EVENT_TYPES")
+  observer_enabled_event_types_helm="${OBSERVER_ENABLED_EVENT_TYPES//,/\\,}"
+  helm_args+=(--set-string "observer.enabledEventTypes=$observer_enabled_event_types_helm")
+fi
+if [[ -n "${OBSERVER_ENABLED_MONGODB_COMMANDS:-}" ]]; then
+  observer_enabled_mongodb_commands_helm="${OBSERVER_ENABLED_MONGODB_COMMANDS//,/\\,}"
+  helm_args+=(--set-string "observer.enabledMongodbCommands=$observer_enabled_mongodb_commands_helm")
 fi
 if [[ -n "${OBSERVER_BATCH_FLUSH_MILLISECONDS:-}" ]]; then
   helm_args+=(--set-string "observer.batchFlushMilliseconds=$OBSERVER_BATCH_FLUSH_MILLISECONDS")

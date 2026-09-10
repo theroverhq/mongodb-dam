@@ -76,6 +76,8 @@ spec:
               value: {{ int64 .Values.observer.batchFlushMilliseconds | quote }}
             - name: OBSERVER_ENABLED_EVENT_TYPES
               value: {{ .Values.observer.enabledEventTypes | quote }}
+            - name: OBSERVER_ENABLED_MONGODB_COMMANDS
+              value: {{ .Values.observer.enabledMongodbCommands | quote }}
             - name: OBSERVER_SPOOL_MAX_BYTES
               value: {{ int64 .Values.observer.spoolMaxBytes | quote }}
           ports:
