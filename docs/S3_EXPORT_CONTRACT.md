@@ -1,6 +1,6 @@
 # S3 gzip-NDJSON export contract
 
-Outpost can upload captured DAM metadata directly to an S3 bucket. Set:
+Outpost can upload captured DAM events directly to an S3 bucket. Events are metadata-only by default; the demoware can opt into bounded MongoDB query content with `OBSERVER_CAPTURE_QUERY_CONTENT=true`. Set:
 
 ```text
 OUTPOST_DESTINATION=s3

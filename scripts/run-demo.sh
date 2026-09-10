@@ -154,4 +154,4 @@ curl --fail --silent "http://127.0.0.1:$observer_port/metrics" \
 printf '\nOutpost counters:\n'
 curl --fail --silent "http://127.0.0.1:$outpost_port/metrics" \
   | grep -E '^mongodb_dam_outpost_(accepted_batches|delivered_batches|delivery_failures)_total ' || true
-printf '\nDemo complete. Query values and document bodies are absent from the DAM rows above.\n'
+printf '\nDemo complete. The table is summarized; inspect details.query in the raw events for captured query content.\n'

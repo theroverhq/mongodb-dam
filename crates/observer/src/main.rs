@@ -96,6 +96,8 @@ struct Cli {
     enabled_event_types: String,
     #[arg(long, env = "OBSERVER_ENABLED_MONGODB_COMMANDS", default_value = "all")]
     enabled_mongodb_commands: String,
+    #[arg(long, env = "OBSERVER_CAPTURE_QUERY_CONTENT", default_value_t = false)]
+    capture_query_content: bool,
     #[arg(
         long,
         env = "OBSERVER_BATCH_FLUSH_MILLISECONDS",
@@ -230,6 +232,7 @@ async fn main() -> Result<()> {
         max_message_bytes: cli.max_message_bytes,
         cpu_profile_hz: cli.cpu_profile_hz,
         principal_hash_salt,
+        capture_query_content: cli.capture_query_content,
     };
     let processor_enabled_event_types = enabled_event_types.clone();
     let processor_enabled_mongodb_commands = enabled_mongodb_commands.clone();

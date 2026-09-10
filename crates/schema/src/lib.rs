@@ -56,8 +56,13 @@ impl DamBatch {
         }) {
             return Err("event identity does not match batch identity");
         }
-        if self.events.iter().any(|event| !event.capture.metadata_only) {
-            return Err("event violates the metadata-only contract");
+        if self.events.iter().any(|event| match &event.payload {
+            EventPayload::MongodbActivity(activity) => {
+                activity.query.is_some() == event.capture.metadata_only
+            }
+            _ => !event.capture.metadata_only,
+        }) {
+            return Err("capture metadata does not match MongoDB query-content presence");
         }
         Ok(())
     }
@@ -222,6 +227,8 @@ pub struct MongodbActivity {
     pub delete_statements: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affected_documents: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<serde_json::Value>,
     pub request_id: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<i32>,
@@ -335,7 +342,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serialized_activity_has_no_raw_body_field() {
+    fn serialized_activity_can_include_query_content() {
         let event = DamEvent {
             schema_version: EVENT_SCHEMA_VERSION,
             event_id: "evt-1".into(),
@@ -350,7 +357,7 @@ mod tests {
                 node_name: "node".into(),
                 source: CaptureSource::OpenSslUprobe,
                 confidence: CaptureConfidence::Complete,
-                metadata_only: true,
+                metadata_only: false,
                 truncated: false,
             },
             kubernetes: None,
@@ -373,6 +380,11 @@ mod tests {
                 delete_scope: None,
                 delete_statements: None,
                 affected_documents: None,
+                query: Some(serde_json::json!({
+                    "find": "orders",
+                    "filter": {"customer_id": "cust-001"},
+                    "$db": "sales"
+                })),
                 request_id: 7,
                 response_id: Some(8),
                 request_bytes: 64,
@@ -392,9 +404,8 @@ mod tests {
         };
 
         let json = serde_json::to_string(&event).unwrap();
-        assert!(!json.contains("filter"));
-        assert!(!json.contains("document"));
-        assert!(!json.contains("raw_body"));
+        assert!(json.contains("filter"));
+        assert!(json.contains("cust-001"));
         assert!(json.contains("mongodb_activity"));
         assert!(json.contains("dam-demo-alice"));
         assert!(json.contains("aws_secrets_manager"));
@@ -450,7 +461,7 @@ mod tests {
         batch.events[0].capture.metadata_only = false;
         assert_eq!(
             batch.validate(),
-            Err("event violates the metadata-only contract")
+            Err("capture metadata does not match MongoDB query-content presence")
         );
     }
 }

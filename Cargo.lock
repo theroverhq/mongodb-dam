@@ -1660,6 +1660,7 @@ name = "mongo-protocol"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "serde_json",
  "snap",
  "thiserror 2.0.20",
  "zstd",

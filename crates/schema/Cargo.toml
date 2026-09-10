@@ -7,7 +7,5 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
-time.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+time.workspace = true

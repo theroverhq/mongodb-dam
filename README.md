@@ -1,6 +1,6 @@
 # MongoDB DAM
 
-Standalone customer-cluster components for a MongoDB Database Activity Monitoring product. This repository deploys MongoDB Community, one eBPF Observer per Linux node, and a durable Outpost that uploads sanitized metadata to a configured S3 bucket as gzip-compressed NDJSON. A bearer-authenticated HTTP destination remains available for the bundled local receiver and compatibility tests.
+Standalone customer-cluster components for a MongoDB Database Activity Monitoring product. This repository deploys MongoDB Community, one eBPF Observer per Linux node, and a durable Outpost that uploads bounded DAM events to a configured S3 bucket as gzip-compressed NDJSON. A bearer-authenticated HTTP destination remains available for the bundled local receiver and compatibility tests.
 
 It has no dependency on the Foundry infrastructure repository and contains no GitHub Actions. Building, pushing, and deployment are initiated locally.
 
@@ -13,7 +13,7 @@ flowchart LR
         P[Outpost Deployment<br/>validate + K8s/identity enrich]
         S[(Outpost PVC spool)]
         M -->|syscalls, TCP, uprobes, scheduling| O
-        O -->|metadata only| Q -->|authenticated HTTP| P --> S
+        O -->|bounded DAM events| Q -->|authenticated HTTP| P --> S
     end
     S -->|S3 PutObject<br/>gzip NDJSON| B[(Configured S3 bucket)]
     B -. future consumer .-> C[Regional Collect ingestion]
@@ -28,7 +28,7 @@ flowchart LR
 - Plaintext UDP DNS query/response metadata for MongoDB processes, including name, record type, response code, answer count, and correlated duration.
 - `pread`, `pwrite`, `fsync`, `fdatasync`, `openat`, slow page-fault, scheduler off-CPU, on-CPU stack, and `pthread_mutex_lock` wait telemetry.
 - MongoDB process exec/exit tracking, socket endpoint lookup, pod UID extraction from cgroups, and Outpost enrichment from the Kubernetes API.
-- A versioned metadata-only event contract, node-local and Outpost durable spools, assignment validation, internal authentication, deterministic S3 object keys, gzip NDJSON encoding, health endpoints, and Prometheus metrics.
+- A versioned event contract with metadata-only defaults and opt-in MongoDB query content for demoware, node-local and Outpost durable spools, assignment validation, internal authentication, deterministic S3 object keys, gzip NDJSON encoding, health endpoints, and Prometheus metrics.
 - Optional demo-only Outpost enrichment that maps a salted MongoDB principal to an AWS IAM principal and the exact Secrets Manager credential ARN before export.
 - An optional bearer-authenticated HTTPS exporter retained for the bundled receiver and legacy integration tests.
 - A generic mock endpoint for integration testing.
@@ -37,7 +37,7 @@ The chart pins the official Community image to `mongo:8.0.29-noble`. Override it
 
 ## Privacy boundary
 
-The eBPF program copies at most 1 KiB from a MongoDB I/O operation into a node-local ring buffer so the Observer can identify BSON metadata. Userspace caps each large-frame prefix at 1 KiB even when it arrives through many short syscalls. Those transient bytes are never logged, serialized, spooled, or sent to Outpost. Only the fields defined in `dam-schema` can cross the node boundary; no attempt is made to retain or export the omitted body.
+The eBPF program copies at most 1 KiB from a MongoDB I/O operation into a node-local ring buffer. Userspace caps each large-frame prefix at 1 KiB even when it arrives through many short syscalls. By default those transient bytes are used only to derive metadata and are never serialized. When `OBSERVER_CAPTURE_QUERY_CONTENT=true`, Observer additionally exports the decoded command document in `details.query` for `find`, `aggregate`, `insert`, `update`, and `delete`, but only when the complete BSON command fits within that bounded capture. Larger or incomplete commands retain their normal metadata and omit `details.query`; Observer never exports partial query JSON.
 
 MongoDB authentication principals are never emitted in clear text. Observer extracts a username from an explicit BSON `user` field or the SCRAM client-first payload when present, immediately hashes it with the customer-provided salt, and discards the clear value. In the opt-in IAM demo, Outpost can join that salted hash to a protected customer mapping and export the corresponding IAM ARN, AWS account ID, and Secrets Manager secret ARN as actor metadata. Passwords, AWS credentials, proofs, nonces, and complete authentication payloads are never serialized or exported.
 
@@ -90,6 +90,7 @@ For the query-only demo, keep these values in `.env`. If `.env` already exists, 
 ```dotenv
 OBSERVER_ENABLED_EVENT_TYPES=mongodb_activity
 OBSERVER_ENABLED_MONGODB_COMMANDS=find,aggregate,insert,update,delete
+OBSERVER_CAPTURE_QUERY_CONTENT=true
 OBSERVER_BATCH_FLUSH_MILLISECONDS=60000
 OBSERVER_BATCH_MAX_EVENTS=10000
 OUTPOST_EXPORT_INTERVAL_SECONDS=60
@@ -98,7 +99,7 @@ OBSERVER_LOCK_PROFILING=false
 OBSERVER_TLS_UPROBES=off
 ```
 
-This creates one query-only Observer batch every 60 seconds under normal demo volume, which becomes one gzip NDJSON object in S3. Empty minutes create no object. The command allowlist drops health checks and driver maintenance commands such as `ping`, `hello`, and `isMaster`; only `find`, `aggregate`, `insert`, `update`, and `delete` activities are exported. The high batch limit prevents the small demo workload from flushing early. CPU sampling, lock profiling, and unused TLS uprobes are disabled for this cleartext MongoDB demo. Authentication and connection events are still processed internally because they are required to associate a MongoDB command with its SCRAM user, but only allowed `mongodb_activity` records cross the Observer-to-Outpost boundary. To restore every MongoDB command, set `OBSERVER_ENABLED_MONGODB_COMMANDS=all`; to restore every telemetry type, also set `OBSERVER_ENABLED_EVENT_TYPES=all`. To change the cadence, change the millisecond flush value. Rebuild the Observer image and redeploy after changing these values:
+This creates one query-only Observer batch every 60 seconds under normal demo volume, which becomes one gzip NDJSON object in S3. Empty minutes create no object. The command allowlist drops health checks and driver maintenance commands such as `ping`, `hello`, and `isMaster`; only `find`, `aggregate`, `insert`, `update`, and `delete` activities are exported. Query-content capture places their complete bounded command BSON in `details.query`. The high batch limit prevents the small demo workload from flushing early. CPU sampling, lock profiling, and unused TLS uprobes are disabled for this cleartext MongoDB demo. Authentication and connection events are still processed internally because they are required to associate a MongoDB command with its SCRAM user, but only allowed `mongodb_activity` records cross the Observer-to-Outpost boundary. To restore every MongoDB command, set `OBSERVER_ENABLED_MONGODB_COMMANDS=all`; to restore every telemetry type, also set `OBSERVER_ENABLED_EVENT_TYPES=all`. To change the cadence, change the millisecond flush value. Rebuild the Observer image and redeploy after changing these values:
 
 ```bash
 ./scripts/build-images.sh
@@ -138,7 +139,7 @@ On a Linux Docker host that permits privileged containers, run the live probe-to
 
 ## Run the presentation demo
 
-The opt-in demo mode adds a constrained REST application so a presenter can seed dummy commerce data, call `find`/`insert`/`update`/`aggregate`/`delete` operations over HTTP from a client machine, and display the metadata that Observer captured and Outpost uploaded. S3 mode is the cross-account path. HTTP mode additionally deploys an in-memory receiver for completely local presentations.
+The opt-in demo mode adds a constrained REST application so a presenter can seed dummy commerce data, call `find`/`insert`/`update`/`aggregate`/`delete` operations over HTTP from a client machine, and display the activity and optional query content that Observer captured and Outpost uploaded. S3 mode is the cross-account path. HTTP mode additionally deploys an in-memory receiver for completely local presentations.
 
 Build it with `BUILD_DEMO=true`, then deploy with `DEMO_MODE=true` and `deploy/examples/s3-demo-values.yaml`; the exact S3 flow is at the end of this README. For a no-AWS local run, use `deploy/examples/demo-values.yaml` and `scripts/run-demo.sh`; individual curl commands are in the [local three-step walkthrough](docs/DEMO.md). MongoDB Community itself does not expose a general-purpose REST query API; the bundled demo API provides that application layer.
 
@@ -197,7 +198,7 @@ To retain the old local HTTP receiver path, set `OUTPOST_DESTINATION=http`, `END
 - `bpf/`: CO-RE eBPF programs and the minimal build-time kernel type header.
 - `crates/observer/`: probe loader, bounded sanitizer, correlation, enrichment, batching, and node spool.
 - `crates/outpost/`: authenticated intake, Kubernetes enrichment, PVC spool, and S3 gzip-NDJSON/HTTPS exporters.
-- `crates/mongo-protocol/`: safe MongoDB wire/BSON metadata decoder.
+- `crates/mongo-protocol/`: safe, bounded MongoDB wire/BSON decoder.
 - `crates/schema/`: the only serializable data model allowed out of the customer node.
 - `crates/mock-endpoint/`: local stand-in for the optional HTTP destination.
 - `demo/api/`: disposable HTTP application that creates visible MongoDB activity.
@@ -275,7 +276,7 @@ The output table includes:
 OBSERVED_AT  COMMAND  DATABASE  COLLECTION  DURATION_US  SUCCEEDED  SOURCE  POD
 ```
 
-It should show `find`, `insert`, `update`, `aggregate`, and `delete`, without query filters, emails, order IDs, amounts, or document bodies.
+It should show `find`, `insert`, `update`, `aggregate`, and `delete`. With `OBSERVER_CAPTURE_QUERY_CONTENT=true`, each complete bounded command also appears under `details.query`, including filters and document values.
 
 The implementation is in [run-demo.sh](scripts/run-demo.sh), and the demo Kubernetes components are in [demo.yaml](deploy/helm/mongodb-dam/templates/demo.yaml).
 
@@ -299,7 +300,7 @@ curl on the AWS-logged user machine
                                   └── Outpost enriches and uploads gzip NDJSON to S3
 ```
 
-AWS IAM is the gate for obtaining the database credential; MongoDB Community performs SCRAM-SHA-256 authentication. The clear IAM ARN and Secrets Manager ARN are stored in a protected, demo-only Kubernetes Secret mounted only into Outpost. Outpost performs the trusted join and exports those identifiers as metadata. Passwords, AWS credentials, delete filters, and document bodies are not exported.
+AWS IAM is the gate for obtaining the database credential; MongoDB Community performs SCRAM-SHA-256 authentication. The clear IAM ARN and Secrets Manager ARN are stored in a protected, demo-only Kubernetes Secret mounted only into Outpost. Outpost performs the trusted join and exports those identifiers as metadata. With query-content capture enabled, database filters and document values are intentionally exported for the demo. Passwords, AWS credentials, SCRAM proofs, nonces, and authentication command payloads are never exported.
 
 In the MongoDB wire command, [`limit: 0` identifies a multi-delete and response field `n` reports the deleted count](https://www.mongodb.com/docs/manual/reference/command/delete/). Observer correlates those request and response facts on the authenticated connection, then Outpost validates, enriches, and delivers the event. Neither component assigns a severity, emits a finding, evaluates a rule, or blocks a user. Those responsibilities belong to Sentinel downstream of Collect.
 
@@ -534,6 +535,7 @@ The command waits for Observer → Outpost → S3 delivery, downloads recent `.n
   "delete_scope": "multi",
   "delete_statements": 1,
   "affected_documents": 35,
+  "query": {"delete": "customer_records", "deletes": [{"q": {"demo_batch": "iam-bulk-delete"}, "limit": 0}], "$db": "dam_demo"},
   "succeeded": true,
   "error_code": null,
   "error_name": null,
@@ -548,7 +550,7 @@ The command waits for Observer → Outpost → S3 delivery, downloads recent `.n
 }
 ```
 
-This output is the proof: the command came from the direct MongoDB user, Observer attributed it to the salted SCRAM principal, Outpost joined the protected IAM mapping and delivered it, and no query predicate or document body crossed the boundary. The IAM and secret ARNs shown here are inside the exported event so Collect can persist the actor and Rover can display and target the correct demo identity.
+This output is the proof: the command came from the direct MongoDB user, Observer attributed it to the salted SCRAM principal, captured the complete bounded command under `details.query`, and Outpost joined the protected IAM mapping and delivered it. The IAM and secret ARNs shown here are inside the exported event so Collect can persist the actor and Rover can display and target the correct demo identity.
 
 The S3 object is the customer-to-regional handoff for this demo. Once Collect consumes that prefix, Sentinel can match a rule such as “successful multi-delete affecting at least 10 documents.” No rule, severity, finding, or blocking action is produced in this customer-side repository.
 
@@ -725,6 +727,39 @@ Print recent MongoDB activities from the compressed objects:
 EVENT_TYPE=mongodb_activity DATABASE=dam_demo ./scripts/show-s3-events.sh
 ```
 
+To find the exact request produced by
+`curl -sS 'http://127.0.0.1:18082/v1/orders?customer_id=cust-001'`, search its MongoDB filter:
+
+```bash
+EVENT_TYPE=mongodb_activity DATABASE=dam_demo ./scripts/show-s3-events.sh \
+  | jq '.[] | select(
+      .details.command == "find"
+      and .details.collection == "orders"
+      and .details.query.filter.customer_id == "cust-001"
+    )'
+```
+
+The matching event contains the actual MongoDB command, not the HTTP URL:
+
+```json
+{
+  "event_type": "mongodb_activity",
+  "capture": {"metadata_only": false, "truncated": false},
+  "details": {
+    "command": "find",
+    "database": "dam_demo",
+    "collection": "orders",
+    "query": {
+      "find": "orders",
+      "filter": {"customer_id": "cust-001"},
+      "$db": "dam_demo"
+    }
+  }
+}
+```
+
+Only activity captured after rebuilding and redeploying the Observer can contain `details.query`; existing S3 objects are unchanged. After rerunning the curl, allow up to the configured 60-second batch interval for the new object.
+
 For the IAM-mapped bulk-delete proof, run:
 
 ```bash
@@ -746,11 +781,11 @@ The actual object has `Content-Type: application/x-ndjson` and `Content-Encoding
   "tenant_id": "tenant-demo",
   "source_id": "mongodb-demo",
   "regional_cell_id": "cell-ap-south-1",
-  "capture": {"sensor_id": "observer-ip-10-0-1-10", "node_name": "ip-10-0-1-10", "source": "cleartext_syscall", "confidence": "complete", "metadata_only": true, "truncated": false},
+  "capture": {"sensor_id": "observer-ip-10-0-1-10", "node_name": "ip-10-0-1-10", "source": "cleartext_syscall", "confidence": "complete", "metadata_only": false, "truncated": false},
   "kubernetes": {"cluster_name": "customer-demo-eks", "namespace": "mongodb-dam", "pod_name": "mongodb-dam-mongodb-0", "container_name": "mongodb"},
   "identity": {"provider": "aws", "principal_type": "iam_user", "principal_arn": "arn:aws:iam::111122223333:user/dam-demo-alice", "account_id": "111122223333", "credential_source": "aws_secrets_manager", "credential_resource": "arn:aws:secretsmanager:ap-south-1:111122223333:secret:mongodb-dam/demo/direct-user-AbCdEf"},
   "event_type": "mongodb_activity",
-  "details": {"command": "delete", "database": "dam_demo", "collection": "customer_records", "principal": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "principal_hashed": true, "delete_scope": "multi", "delete_statements": 1, "affected_documents": 35, "request_id": 4321, "response_id": 4321, "request_bytes": 156, "response_bytes": 45, "duration_us": 1874, "succeeded": true, "expects_response": true, "compressed": false, "connection": {"connection_id": "8124:17", "fd": 17, "remote": {"address": "10.0.1.25", "port": 41862}, "tcp_srtt_us": 312, "retransmits": 0, "tls": false}}
+  "details": {"command": "delete", "database": "dam_demo", "collection": "customer_records", "principal": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "principal_hashed": true, "delete_scope": "multi", "delete_statements": 1, "affected_documents": 35, "query": {"delete": "customer_records", "deletes": [{"q": {"demo_batch": "iam-bulk-delete"}, "limit": 0}], "$db": "dam_demo"}, "request_id": 4321, "response_id": 4321, "request_bytes": 156, "response_bytes": 45, "duration_us": 1874, "succeeded": true, "expects_response": true, "compressed": false, "connection": {"connection_id": "8124:17", "fd": 17, "remote": {"address": "10.0.1.25", "port": 41862}, "tcp_srtt_us": 312, "retransmits": 0, "tls": false}}
 }
 ```
 

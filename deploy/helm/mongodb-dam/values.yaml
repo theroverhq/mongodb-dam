@@ -84,6 +84,9 @@ observer:
   batchFlushMilliseconds: 1000
   enabledEventTypes: all
   enabledMongodbCommands: all
+  # Opt-in demoware setting. Exports complete supported MongoDB command BSON
+  # only when it fits inside the Observer's bounded capture prefix.
+  captureQueryContent: false
   spoolMaxBytes: 268435456
   spoolHostPath: /var/lib/mongodb-dam/observer
   resources:

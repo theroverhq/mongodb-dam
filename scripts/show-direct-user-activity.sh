@@ -173,6 +173,7 @@ select_activity() {
           delete_scope: .details.delete_scope,
           delete_statements: .details.delete_statements,
           affected_documents: .details.affected_documents,
+          query: .details.query,
           succeeded: .details.succeeded,
           error_code: .details.error_code,
           error_name: .details.error_name,

@@ -142,6 +142,12 @@ if [[ "${OBSERVER_ENABLED_MONGODB_COMMANDS:-}" == *all* \
   printf '%s\n' 'OBSERVER_ENABLED_MONGODB_COMMANDS cannot combine all with named commands.' >&2
   exit 1
 fi
+if [[ -n "${OBSERVER_CAPTURE_QUERY_CONTENT:-}" \
+  && "${OBSERVER_CAPTURE_QUERY_CONTENT}" != true \
+  && "${OBSERVER_CAPTURE_QUERY_CONTENT}" != false ]]; then
+  printf '%s\n' 'OBSERVER_CAPTURE_QUERY_CONTENT must be true or false.' >&2
+  exit 1
+fi
 if [[ "$demo_mode" == "true" \
   && ! "${DIRECT_USER_MAPPING_KEY:-identity-mapping.json}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   printf '%s\n' 'DIRECT_USER_MAPPING_KEY must be a single Kubernetes Secret data key.' >&2
@@ -268,6 +274,9 @@ fi
 if [[ -n "${OBSERVER_ENABLED_MONGODB_COMMANDS:-}" ]]; then
   observer_enabled_mongodb_commands_helm="${OBSERVER_ENABLED_MONGODB_COMMANDS//,/\\,}"
   helm_args+=(--set-string "observer.enabledMongodbCommands=$observer_enabled_mongodb_commands_helm")
+fi
+if [[ -n "${OBSERVER_CAPTURE_QUERY_CONTENT:-}" ]]; then
+  helm_args+=(--set-string "observer.captureQueryContent=$OBSERVER_CAPTURE_QUERY_CONTENT")
 fi
 if [[ -n "${OBSERVER_BATCH_FLUSH_MILLISECONDS:-}" ]]; then
   helm_args+=(--set-string "observer.batchFlushMilliseconds=$OBSERVER_BATCH_FLUSH_MILLISECONDS")

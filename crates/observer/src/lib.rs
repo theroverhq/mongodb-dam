@@ -111,6 +111,7 @@ pub struct ProcessorConfig {
     pub max_message_bytes: usize,
     pub cpu_profile_hz: u32,
     pub principal_hash_salt: Option<String>,
+    pub capture_query_content: bool,
 }
 
 #[derive(Clone)]
@@ -409,8 +410,17 @@ impl EventProcessor {
         };
 
         let delete_scope = request.command.delete_scope.map(delete_scope_name);
+        let query = self
+            .config
+            .capture_query_content
+            .then(|| request.command.query.clone())
+            .flatten();
+        let mut activity_seed = request.seed.clone();
+        if query.is_some() {
+            activity_seed.capture.metadata_only = false;
+        }
         let mut result = vec![self.event_from_seed(
-            request.seed.clone(),
+            activity_seed,
             EventPayload::MongodbActivity(MongodbActivity {
                 command: request.command.name.clone(),
                 database: request.command.database.clone(),
@@ -420,6 +430,7 @@ impl EventProcessor {
                 delete_scope: delete_scope.map(str::to_string),
                 delete_statements: request.command.delete_statements,
                 affected_documents,
+                query,
                 request_id: request.request_id,
                 response_id,
                 request_bytes: request.request_bytes,
@@ -1109,6 +1120,7 @@ mod tests {
             max_message_bytes: 1024 * 1024,
             cpu_profile_hz: 0,
             principal_hash_salt: Some("customer-salt".into()),
+            capture_query_content: true,
         })
     }
 
@@ -1215,6 +1227,7 @@ mod tests {
             speculative_auth: false,
             delete_scope: None,
             delete_statements: None,
+            query: None,
         };
         let hashed = take_hashed_principal(&mut command, Some("customer-salt")).unwrap();
         assert!(hashed.starts_with("sha256:"));
@@ -1223,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn attributes_bulk_delete_to_scram_principal_and_exports_metadata() {
+    fn attributes_bulk_delete_to_scram_principal_and_exports_query_content() {
         let mut processor = test_processor();
         let speculative_hello = MongoCommand {
             name: "hello".into(),
@@ -1234,6 +1247,7 @@ mod tests {
             speculative_auth: true,
             delete_scope: None,
             delete_statements: None,
+            query: None,
         };
         assert!(processor
             .process_message(
@@ -1257,6 +1271,7 @@ mod tests {
             speculative_auth: false,
             delete_scope: None,
             delete_statements: None,
+            query: None,
         };
         processor.process_message(test_raw(3_000), false, request_message(12, sasl_continue));
         processor.process_message(
@@ -1274,6 +1289,11 @@ mod tests {
             speculative_auth: false,
             delete_scope: Some(DeleteScope::Multi),
             delete_statements: Some(1),
+            query: Some(serde_json::json!({
+                "delete": "customer_records",
+                "deletes": [{"q": {"demo_batch": "iam-bulk-delete"}, "limit": 0}],
+                "$db": "dam_demo"
+            })),
         };
         processor.process_message(test_raw(5_000), false, request_message(14, delete));
         let events = processor.process_message(
@@ -1295,6 +1315,45 @@ mod tests {
         );
         assert_eq!(activity.delete_scope.as_deref(), Some("multi"));
         assert_eq!(activity.affected_documents, Some(35));
+        assert_eq!(
+            activity.query.as_ref().unwrap()["deletes"][0]["q"]["demo_batch"],
+            "iam-bulk-delete"
+        );
+        assert!(!events[0].capture.metadata_only);
+    }
+
+    #[test]
+    fn keeps_activity_metadata_only_when_query_capture_is_disabled() {
+        let mut processor = test_processor();
+        processor.config.capture_query_content = false;
+        let find = MongoCommand {
+            name: "find".into(),
+            database: Some("dam_demo".into()),
+            collection: Some("orders".into()),
+            auth_mechanism: None,
+            principal: None,
+            speculative_auth: false,
+            delete_scope: None,
+            delete_statements: None,
+            query: Some(serde_json::json!({
+                "find": "orders",
+                "filter": {"customer_id": "cust-001"},
+                "$db": "dam_demo"
+            })),
+        };
+        processor.process_message(test_raw(5_000), false, request_message(20, find));
+        let events = processor.process_message(
+            test_raw(10_005_000),
+            false,
+            response_message(21, 20, None, None),
+        );
+
+        assert_eq!(events.len(), 1);
+        let EventPayload::MongodbActivity(activity) = &events[0].payload else {
+            panic!("expected MongoDB activity")
+        };
+        assert!(activity.query.is_none());
+        assert!(events[0].capture.metadata_only);
     }
 
     #[test]

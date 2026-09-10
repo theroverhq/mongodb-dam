@@ -8,7 +8,7 @@ This local variant adds:
 - the normal node-local Observer and Outpost pipeline;
 - an in-memory HTTP receiver that accepts Outpost batches and exposes them for inspection.
 
-MongoDB Community does not provide a general-purpose REST query API. The bundled demo API is the application layer that a client machine calls. Observer captures the resulting MongoDB wire-protocol activity at `mongod`; Outpost validates, enriches, spools, and forwards the sanitized metadata to the demo receiver. The separate direct-user flow can additionally mount a protected demo mapping so Outpost exports the IAM user and Secrets Manager ARN associated with a salted MongoDB principal.
+MongoDB Community does not provide a general-purpose REST query API. The bundled demo API is the application layer that a client machine calls. Observer captures the resulting MongoDB wire-protocol activity at `mongod`; Outpost validates, enriches, spools, and forwards it to the demo receiver. The separate direct-user flow can additionally mount a protected demo mapping so Outpost exports the IAM user and Secrets Manager ARN associated with a salted MongoDB principal.
 
 ## Deploy demo mode
 
@@ -29,6 +29,9 @@ ENDPOINT=http://mock-endpoint:8088/v1/ingest/mongodb-dam
 VALUES_FILE=deploy/examples/demo-values.yaml
 BUILD_DEMO=true
 PUSH_IMAGES=true
+OBSERVER_ENABLED_EVENT_TYPES=mongodb_activity
+OBSERVER_ENABLED_MONGODB_COMMANDS=find,aggregate,insert,update,delete
+OBSERVER_CAPTURE_QUERY_CONTENT=true
 ```
 
 Build and push all four demo images, then deploy only after selecting the other-account Kubernetes context deliberately:
@@ -143,7 +146,7 @@ curl --fail --silent \
         }]'
 ```
 
-You should see `find`, `insert`, `update`, `aggregate`, and `delete`. You should not see email addresses, order IDs, products, amounts, filters, or document bodies: the exported contract is metadata-only.
+You should see `find`, `insert`, `update`, `aggregate`, and `delete`. With `OBSERVER_CAPTURE_QUERY_CONTENT=true`, complete bounded command content—including filters and document values—appears under `details.query`. Authentication payloads and credentials remain excluded.
 
 To show the complete three-step flow and counters automatically:
 

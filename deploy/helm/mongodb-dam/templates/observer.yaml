@@ -78,6 +78,8 @@ spec:
               value: {{ .Values.observer.enabledEventTypes | quote }}
             - name: OBSERVER_ENABLED_MONGODB_COMMANDS
               value: {{ .Values.observer.enabledMongodbCommands | quote }}
+            - name: OBSERVER_CAPTURE_QUERY_CONTENT
+              value: {{ .Values.observer.captureQueryContent | quote }}
             - name: OBSERVER_SPOOL_MAX_BYTES
               value: {{ int64 .Values.observer.spoolMaxBytes | quote }}
           ports:

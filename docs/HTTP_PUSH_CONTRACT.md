@@ -18,7 +18,7 @@ Headers:
 
 Body: one `DamBatch` from `crates/schema`, with `schema_version: 1`. Assignment fields are repeated on the batch and every event so the regional ingress can reject cross-customer or cross-source injection before persistence or forwarding.
 
-MongoDB activity may include an optional salted `principal`, `delete_scope`, `delete_statements`, and `affected_documents`. These are capture facts, not customer-side findings: Outpost forwards them so Collect can make them available to Sentinel for downstream rule evaluation. Clear MongoDB usernames, query predicates, document bodies, secret values, and AWS credentials are never part of the HTTP-push contract.
+MongoDB activity may include an optional salted `principal`, `delete_scope`, `delete_statements`, `affected_documents`, and `query`. These are capture facts, not customer-side findings: Outpost forwards them so Collect can make them available to Sentinel for downstream rule evaluation. `query` is present only when the customer explicitly enables query-content capture and the complete supported command fits the bounded capture prefix. Clear MongoDB usernames, authentication payloads, secret values, and AWS credentials are never part of the HTTP-push contract.
 
 The opt-in direct-user demo can add this root-level identity metadata to a MongoDB activity/auth event whose salted principal matches the protected Outpost mapping:
 

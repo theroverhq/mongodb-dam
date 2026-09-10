@@ -1,6 +1,6 @@
 # S3 NDJSON event examples
 
-The `.ndjson.gz` object decompresses into one compact JSON object per line. The examples below are pretty-printed only for readability. Optional fields appear when the relevant probe and correlation data are available; request filters, document bodies, passwords, tokens, and AWS credentials are never included.
+The `.ndjson.gz` object decompresses into one compact JSON object per line. The examples below are pretty-printed only for readability. Optional fields appear when the relevant probe and correlation data are available. With `OBSERVER_CAPTURE_QUERY_CONTENT=true`, complete bounded `find`, `aggregate`, `insert`, `update`, and `delete` commands appear in `details.query`; passwords, authentication payloads, tokens, and AWS credentials are never included.
 
 ## MongoDB bulk-delete activity
 
@@ -22,7 +22,7 @@ The `.ndjson.gz` object decompresses into one compact JSON object per line. The 
     "node_name": "ip-10-0-1-10",
     "source": "cleartext_syscall",
     "confidence": "complete",
-    "metadata_only": true,
+    "metadata_only": false,
     "truncated": false
   },
   "kubernetes": {
@@ -59,6 +59,11 @@ The `.ndjson.gz` object decompresses into one compact JSON object per line. The 
     "delete_scope": "multi",
     "delete_statements": 1,
     "affected_documents": 35,
+    "query": {
+      "delete": "customer_records",
+      "deletes": [{"q": {"demo_batch": "iam-bulk-delete"}, "limit": 0}],
+      "$db": "dam_demo"
+    },
     "request_id": 4321,
     "response_id": 4321,
     "request_bytes": 156,

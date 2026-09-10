@@ -1,4 +1,5 @@
 use flate2::read::ZlibDecoder;
+use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use snap::raw::Decoder as SnappyDecoder;
 use std::io::Read;
 use thiserror::Error;
@@ -34,6 +35,7 @@ pub struct MongoCommand {
     pub speculative_auth: bool,
     pub delete_scope: Option<DeleteScope>,
     pub delete_statements: Option<u32>,
+    pub query: Option<JsonValue>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +475,7 @@ fn decoded_op_query(
             speculative_auth: false,
             delete_scope: None,
             delete_statements: None,
+            query: summary.query,
         })
     };
     DecodedMessage {
@@ -615,6 +618,7 @@ fn decode_op_msg(
     let mut offset = 4;
     let mut summary = None;
     let mut delete_sequence = None;
+    let mut document_sequences = Vec::new();
 
     while offset < end {
         let kind = payload[offset];
@@ -658,6 +662,13 @@ fn decode_op_msg(
                             .ok_or(DecodeError::InvalidBson)?,
                     )?);
                 }
+                if let Ok(documents) = bson_document_sequence_to_json(
+                    payload
+                        .get(documents_start..section_end)
+                        .ok_or(DecodeError::InvalidBson)?,
+                ) {
+                    document_sequences.push((identifier.to_string(), documents));
+                }
                 offset = section_end;
             }
             other => return Err(DecodeError::UnsupportedSection(other)),
@@ -668,6 +679,17 @@ fn decode_op_msg(
     if let Some((scope, statements)) = delete_sequence {
         summary.delete_scope = scope;
         summary.delete_statements = Some(statements);
+    }
+    if summary
+        .first_key
+        .as_deref()
+        .is_some_and(|command| command_captures_query(&command.to_ascii_lowercase()))
+    {
+        if let Some(JsonValue::Object(query)) = summary.query.as_mut() {
+            for (identifier, documents) in document_sequences {
+                query.insert(identifier, JsonValue::Array(documents));
+            }
+        }
     }
     let command = if response_to == 0 {
         command_from_summary(&summary)
@@ -714,6 +736,7 @@ struct BsonSummary {
     delete_statements: Option<u32>,
     affected_count: Option<u64>,
     auth_done: Option<bool>,
+    query: Option<JsonValue>,
 }
 
 fn command_from_summary(summary: &BsonSummary) -> Option<MongoCommand> {
@@ -745,7 +768,15 @@ fn command_from_summary(summary: &BsonSummary) -> Option<MongoCommand> {
         delete_statements: (normalized == "delete")
             .then_some(summary.delete_statements)
             .flatten(),
+        query: summary.query.clone(),
     })
+}
+
+fn command_captures_query(command: &str) -> bool {
+    matches!(
+        command,
+        "find" | "aggregate" | "insert" | "update" | "delete"
+    )
 }
 
 /// BSON's first value is command-specific. Keep this list deny-by-default so
@@ -884,6 +915,13 @@ fn summarize_bson_inner(
         }
         ordinal += 1;
     }
+    if summary
+        .first_key
+        .as_deref()
+        .is_some_and(|command| command_captures_query(&command.to_ascii_lowercase()))
+    {
+        summary.query = bson_document_to_json(document).ok();
+    }
     Ok(summary)
 }
 
@@ -896,6 +934,9 @@ fn summarize_bson_prefix(document: &[u8]) -> Result<BsonSummary, DecodeError> {
         return Err(DecodeError::InvalidBson);
     }
     let declared = declared as usize;
+    if document.len() >= declared {
+        return summarize_bson_inner(&document[..declared], true);
+    }
     let available_end = document.len().min(declared.saturating_sub(1));
     let mut summary = BsonSummary::default();
     let mut offset = 4;
@@ -985,6 +1026,153 @@ fn summarize_bson_prefix(document: &[u8]) -> Result<BsonSummary, DecodeError> {
         return Err(DecodeError::Truncated);
     }
     Ok(summary)
+}
+
+fn bson_document_to_json(document: &[u8]) -> Result<JsonValue, DecodeError> {
+    bson_container_to_json(document, false)
+}
+
+fn bson_array_to_json(document: &[u8]) -> Result<JsonValue, DecodeError> {
+    bson_container_to_json(document, true)
+}
+
+fn bson_container_to_json(document: &[u8], array: bool) -> Result<JsonValue, DecodeError> {
+    if document.len() < 5
+        || read_i32(document, 0)? as usize != document.len()
+        || document.last() != Some(&0)
+    {
+        return Err(DecodeError::InvalidBson);
+    }
+    let mut object = JsonMap::new();
+    let mut values = Vec::new();
+    let mut offset = 4;
+    while offset < document.len() - 1 {
+        let element_type = document[offset];
+        offset += 1;
+        let (key, after_key) = read_cstring(document, offset)?;
+        let (value, next) = bson_value_to_json(document, after_key, element_type)?;
+        if next > document.len() - 1 {
+            return Err(DecodeError::InvalidBson);
+        }
+        if array {
+            values.push(value);
+        } else {
+            object.insert(key.to_string(), value);
+        }
+        offset = next;
+    }
+    Ok(if array {
+        JsonValue::Array(values)
+    } else {
+        JsonValue::Object(object)
+    })
+}
+
+fn bson_document_sequence_to_json(documents: &[u8]) -> Result<Vec<JsonValue>, DecodeError> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset < documents.len() {
+        let length = read_i32(documents, offset)?;
+        if length < 5 {
+            return Err(DecodeError::InvalidBson);
+        }
+        let end = offset
+            .checked_add(length as usize)
+            .filter(|end| *end <= documents.len())
+            .ok_or(DecodeError::InvalidBson)?;
+        result.push(bson_document_to_json(&documents[offset..end])?);
+        offset = end;
+    }
+    Ok(result)
+}
+
+fn bson_value_to_json(
+    bytes: &[u8],
+    offset: usize,
+    element_type: u8,
+) -> Result<(JsonValue, usize), DecodeError> {
+    let end = skip_value(bytes, offset, element_type)?;
+    let value = match element_type {
+        0x01 => {
+            let value = f64::from_le_bytes(
+                bytes
+                    .get(offset..end)
+                    .ok_or(DecodeError::InvalidBson)?
+                    .try_into()
+                    .map_err(|_| DecodeError::InvalidBson)?,
+            );
+            JsonNumber::from_f64(value)
+                .map(JsonValue::Number)
+                .unwrap_or_else(|| json!({"$numberDouble": value.to_string()}))
+        }
+        0x02 => JsonValue::String(read_bson_string(bytes, offset)?),
+        0x03 => bson_document_to_json(bytes.get(offset..end).ok_or(DecodeError::InvalidBson)?)?,
+        0x04 => bson_array_to_json(bytes.get(offset..end).ok_or(DecodeError::InvalidBson)?)?,
+        0x05 => {
+            let subtype = *bytes.get(offset + 4).ok_or(DecodeError::InvalidBson)?;
+            let data = read_bson_binary(bytes, offset)?;
+            json!({
+                "$binary": {
+                    "hex": encode_hex(data),
+                    "subType": format!("{subtype:02x}")
+                }
+            })
+        }
+        0x06 => json!({"$undefined": true}),
+        0x07 => json!({
+            "$oid": encode_hex(bytes.get(offset..end).ok_or(DecodeError::InvalidBson)?)
+        }),
+        0x08 => JsonValue::Bool(*bytes.get(offset).ok_or(DecodeError::InvalidBson)? != 0),
+        0x09 => json!({"$date": {"$numberLong": read_i64(bytes, offset)?.to_string()}}),
+        0x0a => JsonValue::Null,
+        0x0b => {
+            let (pattern, after_pattern) = read_cstring(bytes, offset)?;
+            let (options, _) = read_cstring(bytes, after_pattern)?;
+            json!({"$regularExpression": {"pattern": pattern, "options": options}})
+        }
+        0x0c => {
+            let namespace = read_bson_string(bytes, offset)?;
+            let namespace_length = read_i32(bytes, offset)? as usize;
+            let object_id_start = offset + 4 + namespace_length;
+            json!({
+                "$dbPointer": {
+                    "$ref": namespace,
+                    "$id": encode_hex(
+                        bytes
+                            .get(object_id_start..end)
+                            .ok_or(DecodeError::InvalidBson)?
+                    )
+                }
+            })
+        }
+        0x0d => json!({"$code": read_bson_string(bytes, offset)?}),
+        0x0e => json!({"$symbol": read_bson_string(bytes, offset)?}),
+        0x10 => JsonValue::Number(JsonNumber::from(read_i32(bytes, offset)?)),
+        0x11 => {
+            let value = read_u64(bytes, offset)?;
+            json!({"$timestamp": {"t": value >> 32, "i": value & 0xffff_ffff}})
+        }
+        0x12 => JsonValue::Number(JsonNumber::from(read_i64(bytes, offset)?)),
+        0x13 => json!({
+            "$numberDecimalBytes": encode_hex(
+                bytes.get(offset..end).ok_or(DecodeError::InvalidBson)?
+            )
+        }),
+        0x7f => json!({"$maxKey": 1}),
+        0xff => json!({"$minKey": 1}),
+        _ => return Err(DecodeError::InvalidBson),
+    };
+    Ok((value, end))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn skip_value(bytes: &[u8], offset: usize, element_type: u8) -> Result<usize, DecodeError> {
@@ -1278,6 +1466,24 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, DecodeError> {
         .map_err(|_| DecodeError::Truncated)
 }
 
+fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, DecodeError> {
+    bytes
+        .get(offset..offset + 8)
+        .ok_or(DecodeError::Truncated)?
+        .try_into()
+        .map(i64::from_le_bytes)
+        .map_err(|_| DecodeError::Truncated)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, DecodeError> {
+    bytes
+        .get(offset..offset + 8)
+        .ok_or(DecodeError::Truncated)?
+        .try_into()
+        .map(u64::from_le_bytes)
+        .map_err(|_| DecodeError::Truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1415,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_fragmented_find_without_query_values() {
+    fn decodes_fragmented_find_with_query_content() {
         let bson = document(vec![
             string_element("find", "orders"),
             string_element("$db", "sales"),
@@ -1437,12 +1643,37 @@ mod tests {
                 speculative_auth: false,
                 delete_scope: None,
                 delete_statements: None,
+                query: Some(json!({"find": "orders", "$db": "sales"})),
             })
         );
     }
 
     #[test]
-    fn extracts_bulk_delete_scope_and_affected_count_without_filter_values() {
+    fn captures_complete_find_query_content() {
+        let filter = document(vec![string_element("customer_id", "cust-001")]);
+        let bson = document(vec![
+            string_element("find", "orders"),
+            embedded_element(0x03, "filter", &filter),
+            string_element("$db", "dam_demo"),
+        ]);
+        let frame = op_msg(42, 0, 0, bson);
+        let command = decode_frame(&frame, DEFAULT_MAX_MESSAGE_BYTES)
+            .unwrap()
+            .command
+            .unwrap();
+
+        assert_eq!(
+            command.query,
+            Some(json!({
+                "find": "orders",
+                "filter": {"customer_id": "cust-001"},
+                "$db": "dam_demo"
+            }))
+        );
+    }
+
+    #[test]
+    fn extracts_bulk_delete_scope_affected_count_and_query() {
         let private_filter = document(vec![string_element(
             "customer_email",
             "private@example.invalid",
@@ -1472,7 +1703,10 @@ mod tests {
         assert_eq!(command.collection.as_deref(), Some("customer_records"));
         assert_eq!(command.delete_scope, Some(DeleteScope::Multi));
         assert_eq!(command.delete_statements, Some(1));
-        assert!(!format!("{command:?}").contains("private@example.invalid"));
+        assert_eq!(
+            command.query.as_ref().unwrap()["deletes"][0]["q"]["customer_email"],
+            "private@example.invalid"
+        );
 
         let response = op_msg(
             62,
@@ -1511,7 +1745,10 @@ mod tests {
 
         assert_eq!(command.delete_scope, Some(DeleteScope::Multi));
         assert_eq!(command.delete_statements, Some(1));
-        assert!(!format!("{command:?}").contains("private-tenant"));
+        assert_eq!(
+            command.query.as_ref().unwrap()["deletes"][0]["q"]["tenant"],
+            "private-tenant"
+        );
     }
 
     #[test]
@@ -1549,6 +1786,7 @@ mod tests {
         assert_eq!(command.name, "saslStart");
         assert_eq!(command.auth_mechanism.as_deref(), Some("SCRAM-SHA-256"));
         assert_eq!(command.principal.as_deref(), Some("alice,ops"));
+        assert!(command.query.is_none());
     }
 
     #[test]
@@ -1576,6 +1814,7 @@ mod tests {
         assert!(command.speculative_auth);
         assert_eq!(command.principal.as_deref(), Some("alice"));
         assert_eq!(command.auth_mechanism.as_deref(), Some("SCRAM-SHA-256"));
+        assert!(command.query.is_none());
 
         let speculative_response = document(vec![
             int_element("conversationId", 1),
@@ -1623,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_legacy_collection_queries_to_find_without_filter_values() {
+    fn maps_legacy_collection_queries_to_find() {
         let query = op_query(
             53,
             "sales.orders",
@@ -1670,6 +1909,7 @@ mod tests {
         assert_eq!(command.collection.as_deref(), Some("orders"));
         assert_eq!(command.database.as_deref(), Some("sales"));
         assert_eq!(message.wire_bytes as usize, frame.len());
+        assert!(command.query.is_none());
     }
 
     #[test]
@@ -1717,6 +1957,7 @@ mod tests {
             messages[0].command.as_ref().unwrap().database.as_deref(),
             Some("sales")
         );
+        assert!(messages[0].command.as_ref().unwrap().query.is_none());
         assert_eq!(decoder.buffered_bytes(), 0);
     }
 
