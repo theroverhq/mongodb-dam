@@ -92,6 +92,8 @@ struct Cli {
     spool_max_bytes: u64,
     #[arg(long, env = "OBSERVER_BATCH_MAX_EVENTS", default_value_t = 200)]
     batch_max_events: usize,
+    #[arg(long, env = "OBSERVER_ENABLED_EVENT_TYPES", default_value = "all")]
+    enabled_event_types: String,
     #[arg(
         long,
         env = "OBSERVER_BATCH_FLUSH_MILLISECONDS",
@@ -179,6 +181,8 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    let enabled_event_types = parse_enabled_event_types(&cli.enabled_event_types)?;
+    let emit_sensor_health = event_type_is_enabled(&enabled_event_types, "sensor_health");
 
     let sensor_id = cli
         .sensor_id
@@ -224,12 +228,19 @@ async fn main() -> Result<()> {
         cpu_profile_hz: cli.cpu_profile_hz,
         principal_hash_salt,
     };
+    let processor_enabled_event_types = enabled_event_types.clone();
     let processor_task = tokio::spawn(async move {
         let mut processor = EventProcessor::new(processor_config);
         while let Some(captured) = kernel_rx.recv().await {
             match processor.process(captured) {
                 Ok(events) => {
                     for event in events {
+                        if !event_type_is_enabled(
+                            &processor_enabled_event_types,
+                            event_type_name(&event.payload),
+                        ) {
+                            continue;
+                        }
                         processor_metrics
                             .metadata_events
                             .fetch_add(1, Ordering::Relaxed);
@@ -254,6 +265,7 @@ async fn main() -> Result<()> {
         assignment.clone(),
         cli.batch_max_events,
         Duration::from_millis(cli.batch_flush_milliseconds.max(100)),
+        emit_sensor_health,
         notify.clone(),
         metrics.clone(),
     ));
@@ -339,6 +351,62 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     let _ = exporter_task.await;
     Ok(())
+}
+
+const SUPPORTED_EVENT_TYPES: [&str; 8] = [
+    "mongodb_activity",
+    "mongodb_connection",
+    "mongodb_auth",
+    "dns_activity",
+    "host_io",
+    "profile",
+    "process_lifecycle",
+    "sensor_health",
+];
+
+fn parse_enabled_event_types(raw: &str) -> Result<Option<HashSet<String>>> {
+    let selected = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        !selected.is_empty(),
+        "enabled_event_types must contain all or at least one event type"
+    );
+    if selected.contains("all") {
+        anyhow::ensure!(
+            selected.len() == 1,
+            "enabled_event_types cannot combine all with named event types"
+        );
+        return Ok(None);
+    }
+    for event_type in &selected {
+        anyhow::ensure!(
+            SUPPORTED_EVENT_TYPES.contains(event_type),
+            "unsupported enabled event type: {event_type}"
+        );
+    }
+    Ok(Some(selected.into_iter().map(ToOwned::to_owned).collect()))
+}
+
+fn event_type_is_enabled(enabled: &Option<HashSet<String>>, event_type: &str) -> bool {
+    enabled
+        .as_ref()
+        .is_none_or(|event_types| event_types.contains(event_type))
+}
+
+fn event_type_name(payload: &EventPayload) -> &'static str {
+    match payload {
+        EventPayload::MongodbActivity(_) => "mongodb_activity",
+        EventPayload::MongodbConnection(_) => "mongodb_connection",
+        EventPayload::MongodbAuth(_) => "mongodb_auth",
+        EventPayload::DnsActivity(_) => "dns_activity",
+        EventPayload::HostIo(_) => "host_io",
+        EventPayload::Profile(_) => "profile",
+        EventPayload::ProcessLifecycle(_) => "process_lifecycle",
+        EventPayload::SensorHealth(_) => "sensor_health",
+    }
 }
 
 fn validate_cli(cli: &Cli) -> Result<()> {
@@ -812,6 +880,7 @@ async fn run_batcher(
     assignment: Assignment,
     max_events: usize,
     flush_interval: Duration,
+    emit_sensor_health: bool,
     notify: Arc<Notify>,
     metrics: Arc<RuntimeMetrics>,
 ) {
@@ -830,7 +899,7 @@ async fn run_batcher(
             }
             _ = ticker.tick() => {
                 timer_fired = true;
-                if last_health.elapsed() >= Duration::from_secs(60) {
+                if emit_sensor_health && last_health.elapsed() >= Duration::from_secs(60) {
                     events.push(sensor_health_event(&assignment, &spool, &metrics));
                     last_health = Instant::now();
                 }

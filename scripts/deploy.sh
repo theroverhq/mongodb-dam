@@ -82,6 +82,56 @@ if [[ "$demo_mode" != "true" && "$demo_mode" != "false" ]]; then
   printf '%s\n' 'DEMO_MODE must be true or false.' >&2
   exit 1
 fi
+for positive_integer_name in \
+  OBSERVER_BATCH_FLUSH_MILLISECONDS OBSERVER_BATCH_MAX_EVENTS \
+  OUTPOST_EXPORT_INTERVAL_SECONDS; do
+  positive_integer_value="${!positive_integer_name:-}"
+  if [[ -n "$positive_integer_value" \
+    && ( ! "$positive_integer_value" =~ ^[0-9]+$ || "$positive_integer_value" == 0 ) ]]; then
+    printf '%s must be a positive integer.\n' "$positive_integer_name" >&2
+    exit 1
+  fi
+done
+if [[ -n "${OBSERVER_CPU_PROFILE_HZ:-}" \
+  && ! "${OBSERVER_CPU_PROFILE_HZ}" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' 'OBSERVER_CPU_PROFILE_HZ must be a non-negative integer.' >&2
+  exit 1
+fi
+if [[ -n "${OBSERVER_LOCK_PROFILING:-}" \
+  && "${OBSERVER_LOCK_PROFILING}" != true \
+  && "${OBSERVER_LOCK_PROFILING}" != false ]]; then
+  printf '%s\n' 'OBSERVER_LOCK_PROFILING must be true or false.' >&2
+  exit 1
+fi
+if [[ -n "${OBSERVER_TLS_UPROBES:-}" \
+  && "${OBSERVER_TLS_UPROBES}" != auto \
+  && "${OBSERVER_TLS_UPROBES}" != required \
+  && "${OBSERVER_TLS_UPROBES}" != off ]]; then
+  printf '%s\n' 'OBSERVER_TLS_UPROBES must be auto, required, or off.' >&2
+  exit 1
+fi
+if [[ -n "${OBSERVER_ENABLED_EVENT_TYPES:-}" \
+  && ! "${OBSERVER_ENABLED_EVENT_TYPES}" =~ ^[a-z_]+(,[a-z_]+)*$ ]]; then
+  printf '%s\n' 'OBSERVER_ENABLED_EVENT_TYPES must be a comma-separated lowercase event-type list.' >&2
+  exit 1
+fi
+if [[ -n "${OBSERVER_ENABLED_EVENT_TYPES:-}" ]]; then
+  IFS=, read -r -a observer_event_types <<<"$OBSERVER_ENABLED_EVENT_TYPES"
+  for observer_event_type in "${observer_event_types[@]}"; do
+    case "$observer_event_type" in
+      all|mongodb_activity|mongodb_connection|mongodb_auth|dns_activity|host_io|profile|process_lifecycle|sensor_health) ;;
+      *)
+        printf 'Unsupported OBSERVER_ENABLED_EVENT_TYPES value: %s\n' "$observer_event_type" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [[ "$OBSERVER_ENABLED_EVENT_TYPES" == *all* \
+    && "$OBSERVER_ENABLED_EVENT_TYPES" != all ]]; then
+    printf '%s\n' 'OBSERVER_ENABLED_EVENT_TYPES cannot combine all with named event types.' >&2
+    exit 1
+  fi
+fi
 if [[ "$demo_mode" == "true" \
   && ! "${DIRECT_USER_MAPPING_KEY:-identity-mapping.json}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   printf '%s\n' 'DIRECT_USER_MAPPING_KEY must be a single Kubernetes Secret data key.' >&2
@@ -201,6 +251,27 @@ helm_args=(
   --set-string "images.outpost.repository=$outpost_repository"
   --set-string "images.outpost.tag=$tag"
 )
+if [[ -n "${OBSERVER_ENABLED_EVENT_TYPES:-}" ]]; then
+  helm_args+=(--set-string "observer.enabledEventTypes=$OBSERVER_ENABLED_EVENT_TYPES")
+fi
+if [[ -n "${OBSERVER_BATCH_FLUSH_MILLISECONDS:-}" ]]; then
+  helm_args+=(--set-string "observer.batchFlushMilliseconds=$OBSERVER_BATCH_FLUSH_MILLISECONDS")
+fi
+if [[ -n "${OBSERVER_BATCH_MAX_EVENTS:-}" ]]; then
+  helm_args+=(--set-string "observer.batchMaxEvents=$OBSERVER_BATCH_MAX_EVENTS")
+fi
+if [[ -n "${OUTPOST_EXPORT_INTERVAL_SECONDS:-}" ]]; then
+  helm_args+=(--set-string "outpost.exportIntervalSeconds=$OUTPOST_EXPORT_INTERVAL_SECONDS")
+fi
+if [[ -n "${OBSERVER_CPU_PROFILE_HZ:-}" ]]; then
+  helm_args+=(--set-string "observer.cpuProfileHz=$OBSERVER_CPU_PROFILE_HZ")
+fi
+if [[ -n "${OBSERVER_LOCK_PROFILING:-}" ]]; then
+  helm_args+=(--set-string "observer.lockProfiling=$OBSERVER_LOCK_PROFILING")
+fi
+if [[ -n "${OBSERVER_TLS_UPROBES:-}" ]]; then
+  helm_args+=(--set-string "observer.tlsUprobes=$OBSERVER_TLS_UPROBES")
+fi
 if [[ "$destination_mode" == "http" ]]; then
   helm_args+=(
     --set-string "destination.mode=http"

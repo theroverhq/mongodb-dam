@@ -82,6 +82,7 @@ observer:
   maxMessageBytes: 50331648
   batchMaxEvents: 200
   batchFlushMilliseconds: 1000
+  enabledEventTypes: all
   spoolMaxBytes: 268435456
   spoolHostPath: /var/lib/mongodb-dam/observer
   resources:
@@ -99,6 +100,7 @@ observer:
 
 outpost:
   replicas: 1
+  exportIntervalSeconds: 5
   spoolMaxBytes: 1073741824
   maxRequestBytes: 5242880
   identityMapping:

@@ -133,6 +133,8 @@ spec:
               value: {{ int64 .Values.outpost.spoolMaxBytes | quote }}
             - name: OUTPOST_MAX_REQUEST_BYTES
               value: {{ int64 .Values.outpost.maxRequestBytes | quote }}
+            - name: OUTPOST_EXPORT_INTERVAL_SECONDS
+              value: {{ int64 .Values.outpost.exportIntervalSeconds | quote }}
             {{- if .Values.outpost.identityMapping.enabled }}
             - name: OUTPOST_IDENTITY_MAPPING_FILE
               value: {{ printf "/var/run/mongodb-dam/identity/%s" .Values.outpost.identityMapping.key | quote }}
